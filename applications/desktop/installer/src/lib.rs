@@ -341,3 +341,23 @@ struct PlatformInstallResult {
 }
 
 use std::sync::Arc;
+
+// =============================================================================
+// PUBLIC INSTALLER APPLICATION INTERFACE EXPORTS
+// =============================================================================
+
+// Installer application exports
+pub use crate::ui::{InstallerInterface, InstallationWizard};
+pub use crate::firmware_flash::{FirmwareFlasher, FlashingConfiguration};
+pub use crate::verification::{InstallationVerifier, ComponentVerifier};
+pub use crate::hardware_detection::{HardwareDetector, CompatibilityChecker};
+
+// Shared type re-exports for installer integration
+pub use shared::types::hardware::InstallationTarget;
+pub use shared::types::error::InstallerError;
+
+/// Module declarations for installer components
+pub mod ui;
+pub mod firmware_flash;
+pub mod verification;
+pub mod hardware_detection;
