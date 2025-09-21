@@ -1,7 +1,18 @@
 // =============================================================================
 // CIBOS CLI PLATFORM - cibos/platform-cli/src/lib.rs
-// Command Line Interface Platform for Servers and Embedded Systems
+// Command Line Interface Platform Runtime Environment
 // =============================================================================
+
+//! CIBOS-CLI Platform Runtime Environment
+//! 
+//! This platform provides command-line interface services for servers, 
+//! embedded systems, and headless deployments. It offers shell services,
+//! system management tools, and background services while maintaining
+//! complete isolation between all running processes.
+//! 
+//! The platform provides the runtime environment where CLI applications
+//! can execute through isolated interfaces, but does NOT directly import
+//! application code to maintain architectural isolation boundaries.
 
 // External CLI platform dependencies
 use anyhow::{Context, Result as AnyhowResult};
@@ -15,34 +26,36 @@ use crossterm::{
     event::{Event, EventStream, KeyCode, KeyEvent},
     terminal::{enable_raw_mode, disable_raw_mode}
 };
+use std::sync::Arc;
+use std::collections::HashMap;
+use uuid::Uuid;
 
-// CIBOS kernel integration
+// CIBOS kernel integration for platform services
 use cibos_kernel::{KernelRuntime, ProcessManager, IsolationManager};
 use cibos_kernel::core::ipc::{SecureChannels, KernelCommunication};
 use cibos_kernel::security::profiles::{ProfileManager, UserProfileData};
 use cibos_kernel::security::authentication::{AuthenticationSystem, CLIAuthenticator};
 
-// CLI platform specific imports
+// CLI platform service imports (NOT application imports)
 use crate::shell::{CommandShell, ShellEnvironment, CommandExecutor, ShellHistory};
 use crate::services::{
-    CLIService, SSHService, FileServerService, MonitoringService, PackageManagerService
+    CLIServiceManager, SSHService, FileServerService, MonitoringService, 
+    PackageManagerService, SystemService
 };
 use crate::tools::{
-    CLIInstaller, ConfigurationManager, DiagnosticsTools, BackupTools
+    CLIToolManager, SystemTools, ConfigurationManager, DiagnosticsTools, 
+    BackupTools, NetworkTools
 };
-
-// Command processing imports
 use crate::commands::{
     BuiltinCommands, SystemCommands, ApplicationCommands,
-    CommandParser, CommandResult, CommandError
+    CommandParser, CommandResult, CommandError, CommandRegistry
 };
-
-// Configuration imports
 use crate::config::{
-    CLIPlatformConfiguration, ShellConfiguration, ServiceConfiguration
+    CLIPlatformConfiguration, ShellConfiguration, ServiceConfiguration,
+    ToolConfiguration, CommandConfiguration
 };
 
-// Shared imports
+// Shared imports for platform integration
 use shared::types::hardware::{CLIHardwareCapabilities, ServerCapabilities, EmbeddedCapabilities};
 use shared::types::isolation::{CLIIsolationLevel, CommandIsolation, ServiceBoundary};
 use shared::types::authentication::{CLIAuthenticationMethod, ServerCredentials};
@@ -51,76 +64,226 @@ use shared::types::error::{CLIError, ShellError, ServiceError};
 use shared::ipc::{CLIChannel, CommandProtocol, ServiceProtocol};
 
 /// Main CLI platform runtime coordinating command interface and services
+/// 
+/// This runtime provides the complete CLI environment including shell services,
+/// background services, system tools, and command execution - all operating
+/// within isolated boundaries to ensure no component can interfere with others.
 #[derive(Debug)]
 pub struct CLIPlatformRuntime {
+    /// Command shell providing interactive user interface
     shell: Arc<CommandShell>,
-    services: Arc<ServiceManager>,
+    
+    /// Service manager coordinating background services
+    services: Arc<CLIServiceManager>,
+    
+    /// Tool manager providing system administration tools
+    tools: Arc<CLIToolManager>,
+    
+    /// Authentication system for user verification
     authentication: Arc<AuthenticationSystem>,
+    
+    /// Isolation manager enforcing boundaries between components
     isolation: Arc<IsolationManager>,
+    
+    /// Platform configuration defining behavior and policies
     config: CLIPlatformConfiguration,
 }
 
-/// Command shell providing isolated command execution
+/// Command shell providing isolated command execution environment
+/// 
+/// The shell manages user interaction, command parsing, execution routing,
+/// and history management while ensuring all commands execute within
+/// their designated isolation boundaries.
 #[derive(Debug)]
 pub struct CommandShell {
+    /// Shell environment managing variables and state
     environment: ShellEnvironment,
+    
+    /// Command executor routing commands to appropriate handlers
     executor: CommandExecutor,
+    
+    /// Command history tracking for user convenience
     history: ShellHistory,
+    
+    /// Command parser converting user input to executable commands
     command_parser: CommandParser,
 }
 
-/// Service manager coordinating platform services
+/// Service manager coordinating isolated platform services
+/// 
+/// Services run continuously in the background, each within its own
+/// isolation boundary, providing functionality like SSH access,
+/// monitoring, and file sharing without interfering with each other.
 #[derive(Debug)]
-pub struct ServiceManager {
+pub struct CLIServiceManager {
+    /// SSH service for remote access (optional)
     ssh_service: Option<Arc<SSHService>>,
+    
+    /// File server service for network file sharing (optional)
     file_server: Option<Arc<FileServerService>>,
+    
+    /// System monitoring service (always active)
     monitoring: Arc<MonitoringService>,
+    
+    /// Package management service for software installation
     package_manager: Arc<PackageManagerService>,
+    
+    /// Service registry tracking all active services
+    service_registry: ServiceRegistry,
+}
+
+/// Tool manager providing system administration utilities
+/// 
+/// Tools are on-demand utilities for system configuration, diagnostics,
+/// backup operations, and maintenance tasks. Each tool execution creates
+/// its own isolated environment to prevent interference.
+#[derive(Debug)]
+pub struct CLIToolManager {
+    /// System configuration tools
+    system_tools: Arc<SystemTools>,
+    
+    /// Configuration management utilities
+    config_manager: Arc<ConfigurationManager>,
+    
+    /// System diagnostics and testing tools
+    diagnostics: Arc<DiagnosticsTools>,
+    
+    /// Backup and recovery utilities
+    backup_tools: Arc<BackupTools>,
+    
+    /// Network configuration and testing tools
+    network_tools: Arc<NetworkTools>,
+    
+    /// Tool registry tracking available utilities
+    tool_registry: ToolRegistry,
+}
+
+#[derive(Debug)]
+struct ServiceRegistry {
+    /// Map of service names to service metadata
+    registered_services: HashMap<String, ServiceMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ServiceMetadata {
+    pub service_name: String,
+    pub service_type: ServiceType,
+    pub isolation_boundary: Uuid,
+    pub startup_time: chrono::DateTime<chrono::Utc>,
+    pub status: ServiceStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ServiceType {
+    SSH,
+    FileServer,
+    Monitoring,
+    PackageManager,
+    SystemService,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ServiceStatus {
+    Starting,
+    Running,
+    Stopped,
+    Failed,
+}
+
+#[derive(Debug)]
+struct ToolRegistry {
+    /// Map of tool names to tool metadata
+    available_tools: HashMap<String, ToolMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolMetadata {
+    pub tool_name: String,
+    pub tool_category: ToolCategory,
+    pub description: String,
+    pub isolation_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ToolCategory {
+    System,
+    Configuration,
+    Diagnostics,
+    Backup,
+    Network,
+    Security,
 }
 
 impl CLIPlatformRuntime {
-    /// Initialize CLI platform from kernel runtime
+    /// Initialize CLI platform runtime from kernel interface
+    /// 
+    /// This creates the complete CLI environment including shell, services,
+    /// tools, and authentication while establishing isolation boundaries
+    /// for each component to ensure secure operation.
     pub async fn initialize(kernel: Arc<KernelRuntime>) -> AnyhowResult<Self> {
-        info!("Initializing CIBOS-CLI platform");
+        info!("Initializing CIBOS-CLI platform runtime");
 
         // Load CLI platform configuration
         let config = CLIPlatformConfiguration::load_default().await
             .context("CLI platform configuration loading failed")?;
 
-        // Initialize authentication system for CLI
+        // Initialize authentication system for CLI users
         let authentication = Arc::new(AuthenticationSystem::new_cli(&config.auth_config).await
             .context("CLI authentication initialization failed")?);
 
-        // Initialize isolation manager for CLI services
+        // Initialize isolation manager for CLI components
         let isolation = Arc::new(IsolationManager::new_cli(&config.isolation_config).await
             .context("CLI isolation manager initialization failed")?);
 
-        // Initialize command shell
+        // Initialize command shell with isolated execution
         let shell = Arc::new(CommandShell::initialize(&config.shell_config, &isolation).await
             .context("Command shell initialization failed")?);
 
-        // Initialize service manager
-        let services = Arc::new(ServiceManager::initialize(&config.service_config, &isolation).await
+        // Initialize service manager with background services
+        let services = Arc::new(CLIServiceManager::initialize(&config.service_config, &isolation).await
             .context("Service manager initialization failed")?);
 
-        info!("CIBOS-CLI platform initialization completed");
+        // Initialize tool manager with system utilities
+        let tools = Arc::new(CLIToolManager::initialize(&config.tool_config, &isolation).await
+            .context("Tool manager initialization failed")?);
+
+        info!("CIBOS-CLI platform initialization completed successfully");
 
         Ok(Self {
             shell,
             services,
+            tools,
             authentication,
             isolation,
             config,
         })
     }
 
-    /// Start CLI platform and enter interactive shell
+    /// Start CLI platform and enter interactive shell mode
+    /// 
+    /// This begins platform operation by starting background services,
+    /// authenticating the user, and entering the interactive shell loop
+    /// where commands can be executed within isolated boundaries.
     pub async fn run(&self) -> AnyhowResult<()> {
-        info!("Starting CIBOS-CLI interactive shell");
+        info!("Starting CIBOS-CLI platform");
 
-        // Start platform services
+        // Start background platform services
         self.services.start_all_services().await
             .context("Failed to start CLI platform services")?;
+
+        // Initialize tool registry for user access
+        self.tools.initialize_tool_registry().await
+            .context("Tool registry initialization failed")?;
+
+        // Authenticate user and establish CLI session
+        let user_session = self.authenticate_user().await
+            .context("CLI user authentication failed")?;
+
+        info!("CLI session established for user profile: {}", user_session.profile_id);
+
+        // Configure shell environment for authenticated user
+        self.shell.configure_for_user(&user_session).await
+            .context("Shell configuration for user failed")?;
 
         // Enter interactive shell loop
         self.shell.run_interactive_loop().await
@@ -129,51 +292,102 @@ impl CLIPlatformRuntime {
         Ok(())
     }
 
-    /// Authenticate user and establish CLI session
+    /// Authenticate user and establish isolated CLI session
+    /// 
+    /// Authentication creates a complete isolation boundary for the user
+    /// session, ensuring all commands and services operate within the
+    /// user's authorized environment without interference.
     pub async fn authenticate_user(&self) -> AnyhowResult<UserSession> {
         info!("Starting CLI user authentication");
 
-        // Detect USB key devices
+        // Detect USB key authentication devices
         let usb_devices = self.authentication.detect_usb_key_devices().await
             .context("USB key device detection failed")?;
 
         if usb_devices.is_empty() {
-            return Err(anyhow::anyhow!("No USB authentication devices detected"));
+            return Err(anyhow::anyhow!("No USB authentication devices detected for CLI login"));
         }
 
-        // Authenticate with detected USB key
+        // Authenticate with detected USB key device
         let auth_result = self.authentication.authenticate_usb_key(&usb_devices[0]).await
             .context("USB key authentication failed")?;
 
-        // Create isolated user session
-        let user_session = UserSession::create(auth_result.profile_id, &self.isolation).await
-            .context("User session creation failed")?;
+        if !auth_result.authenticated {
+            return Err(anyhow::anyhow!("CLI authentication failed"));
+        }
 
-        info!("CLI user authentication successful");
+        // Create isolated user session environment
+        let user_session = UserSession::create(
+            auth_result.profile_id.unwrap(),
+            &self.isolation
+        ).await.context("CLI user session creation failed")?;
+
+        info!("CLI user authentication completed successfully");
         Ok(user_session)
+    }
+
+    /// Execute system tool with isolation boundary
+    /// 
+    /// Tools execute within their own isolated environments to prevent
+    /// interference with the shell or other system components while
+    /// providing access to necessary system functions.
+    pub async fn execute_tool(&self, tool_name: &str, arguments: &[String]) -> AnyhowResult<ToolExecutionResult> {
+        info!("Executing system tool: {} with arguments: {:?}", tool_name, arguments);
+
+        // Validate tool exists and user has permission
+        let tool_metadata = self.tools.get_tool_metadata(tool_name)
+            .context("Tool metadata retrieval failed")?;
+
+        // Create isolated execution environment for tool
+        let execution_boundary = if tool_metadata.isolation_required {
+            Some(self.isolation.create_tool_boundary(tool_name).await
+                .context("Tool isolation boundary creation failed")?)
+        } else {
+            None
+        };
+
+        // Execute tool within isolation boundary
+        let result = self.tools.execute_tool(tool_name, arguments, &execution_boundary).await
+            .context("Tool execution failed")?;
+
+        info!("Tool execution completed: {}", tool_name);
+        Ok(result)
     }
 }
 
+/// User session representing authenticated CLI user environment
 #[derive(Debug)]
 pub struct UserSession {
-    pub session_id: uuid::Uuid,
-    pub profile_id: uuid::Uuid,
-    pub isolation_boundary: uuid::Uuid,
+    pub session_id: Uuid,
+    pub profile_id: Uuid,
+    pub isolation_boundary: Uuid,
     pub session_start: chrono::DateTime<chrono::Utc>,
+    pub environment_variables: HashMap<String, String>,
 }
 
 impl UserSession {
-    async fn create(profile_id: uuid::Uuid, isolation: &IsolationManager) -> AnyhowResult<Self> {
-        let session_id = uuid::Uuid::new_v4();
-        let isolation_boundary = isolation.create_session_boundary(session_id).await?;
+    async fn create(profile_id: Uuid, isolation: &IsolationManager) -> AnyhowResult<Self> {
+        let session_id = Uuid::new_v4();
+        let isolation_boundary = isolation.create_cli_session_boundary(session_id).await?;
 
         Ok(Self {
             session_id,
             profile_id,
             isolation_boundary,
             session_start: chrono::Utc::now(),
+            environment_variables: HashMap::new(),
         })
     }
+}
+
+/// Tool execution result providing status and output
+#[derive(Debug)]
+pub struct ToolExecutionResult {
+    pub success: bool,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub execution_time: std::time::Duration,
 }
 
 // =============================================================================
@@ -181,24 +395,26 @@ impl UserSession {
 // =============================================================================
 
 // CLI platform runtime exports
-pub use crate::shell::{CommandShell, ShellEnvironment, CommandExecutor};
-pub use crate::services::{ServiceManager, MonitoringService, PackageManagerService};
-pub use crate::tools::{CLIInstaller, ConfigurationManager, DiagnosticsTools};
-
-// Command system exports
+pub use crate::shell::{CommandShell, ShellEnvironment, CommandExecutor, ShellHistory};
+pub use crate::services::{CLIServiceManager, MonitoringService, PackageManagerService};
+pub use crate::tools::{CLIToolManager, SystemTools, ConfigurationManager, DiagnosticsTools};
 pub use crate::commands::{BuiltinCommands, SystemCommands, CommandParser, CommandResult};
-
-// Configuration exports
 pub use crate::config::{CLIPlatformConfiguration, ShellConfiguration, ServiceConfiguration};
 
-// Shared type re-exports for CLI integration
+// Shared type re-exports for CLI platform integration
 pub use shared::types::hardware::ServerCapabilities;
 pub use shared::types::isolation::CLIIsolationLevel;
 pub use shared::types::authentication::CLIAuthenticationMethod;
 pub use shared::types::profiles::CLIProfile;
 
-/// Module declarations for phone application components
-pub mod calling;
-pub mod messaging;
-pub mod contacts;
-pub mod ui;
+/// Module declarations for CLI platform components
+/// 
+/// These modules provide the complete CLI platform functionality while
+/// maintaining strict separation from application programs that run
+/// within the platform environment.
+pub mod shell;     // Already created by user
+pub mod services;  // Background services
+pub mod tools;     // System administration tools
+pub mod commands;  // Built-in command implementations
+pub mod config;    // Configuration management
+
