@@ -1,9 +1,19 @@
 // =============================================================================
 // CIBOS GUI PLATFORM - cibos/platform-gui/src/lib.rs
-// Graphical User Interface Platform for Desktop Computing
+// Graphical User Interface Platform Runtime 
 // =============================================================================
 
-// External GUI dependencies
+//! CIBOS-GUI Platform Runtime Environment
+//! 
+//! This platform provides desktop computing services including window management,
+//! graphics coordination, and desktop environment services. Applications are
+//! separate executable programs that connect to this platform through secure
+//! IPC channels, maintaining complete isolation boundaries.
+//! 
+//! The platform does NOT contain applications - it provides the runtime
+//! environment that applications connect to for desktop functionality.
+
+// External GUI platform dependencies
 use anyhow::{Context, Result as AnyhowResult};
 use serde::{Deserialize, Serialize};
 use log::{debug, error, info, warn};
@@ -22,6 +32,7 @@ use wgpu::{
 use std::sync::Arc;
 use std::collections::HashMap;
 use uuid::Uuid;
+use chrono::{DateTime, Utc};
 
 // CIBOS kernel integration
 use cibos_kernel::{KernelRuntime, ProcessManager, IsolationManager};
@@ -29,226 +40,238 @@ use cibos_kernel::core::ipc::{SecureChannels, KernelCommunication};
 use cibos_kernel::security::profiles::{ProfileManager, UserProfileData};
 use cibos_kernel::security::authentication::{AuthenticationSystem, GUIAuthenticator};
 
-// GUI platform specific imports
-use crate::window_manager::{Compositor, WindowManager, DesktopEnvironment};
-use crate::ui::{WidgetSystem, ThemeManager, LayoutEngine, EventDispatcher};
-use crate::apps::{
-    InstallerApplication, TerminalApplication, FileManagerApplication,
-    WebBrowserApplication, TextEditorApplication, PackageManagerApplication,
-    SettingsApplication
-};
-use crate::services::{
-    DesktopService, NotificationService, ClipboardService, AudioService
-};
+// GUI platform service imports (NOT application imports)
+use crate::window_manager::{WindowManager, DesktopEnvironment, Compositor};
+use crate::ui::{WidgetFramework, ThemeManager, LayoutEngine, EventDispatcher};
+use crate::services::{DesktopService, NotificationService, ClipboardService, AudioService};
+use crate::framework::{GUIApplicationFramework, ApplicationIPC, ApplicationLauncher};
 
-// Application framework imports
-use crate::framework::application::{GUIApplication, ApplicationLifecycle, ApplicationManager};
-use crate::framework::widgets::{Widget, Container, Layout, EventHandler};
-use crate::framework::rendering::{Renderer, GraphicsContext, DisplayTarget};
-
-// Shared imports
+// Shared imports for platform integration
 use shared::types::hardware::{DisplayCapabilities, InputCapabilities, AudioCapabilities};
 use shared::types::isolation::{GUIIsolationLevel, WindowIsolation, ApplicationBoundary};
 use shared::types::authentication::{GUIAuthenticationMethod, DesktopCredentials};
 use shared::types::profiles::{DesktopProfile, GUIProfileConfiguration};
-use shared::types::error::{GUIError, WindowManagerError, ApplicationError};
+use shared::types::error::{GUIError, WindowManagerError, PlatformError};
 use shared::ipc::{GUIChannel, WindowManagerProtocol, ApplicationProtocol};
 
-/// Main GUI platform runtime coordinating desktop environment
+/// Main GUI platform runtime coordinating desktop environment services
+/// 
+/// This runtime provides the foundation for desktop computing by managing
+/// windows, graphics, input, and desktop services. Applications connect
+/// to this platform through secure IPC rather than direct integration.
 #[derive(Debug)]
 pub struct GUIPlatformRuntime {
     window_manager: Arc<WindowManager>,
     desktop_environment: Arc<DesktopEnvironment>,
-    application_manager: Arc<ApplicationManager>,
-    security_manager: Arc<SecurityManager>,
+    application_framework: Arc<GUIApplicationFramework>,
+    desktop_services: Arc<DesktopServiceManager>,
     kernel_interface: Arc<KernelRuntime>,
     config: GUIConfiguration,
 }
 
-/// Desktop environment providing window management and user interface
+/// Desktop environment providing window management and user interface services
+/// 
+/// The desktop environment coordinates visual elements and user interaction
+/// while maintaining isolation between different application windows and
+/// user interface components.
 #[derive(Debug)]
 pub struct DesktopEnvironment {
     compositor: Compositor,
     theme_manager: ThemeManager,
-    widget_system: WidgetSystem,
+    widget_framework: WidgetFramework,
     event_dispatcher: EventDispatcher,
 }
 
-/// Application manager coordinating isolated desktop applications
+/// Application framework providing IPC interfaces for desktop applications
+/// 
+/// This framework enables applications to connect to the desktop platform
+/// through secure communication channels rather than direct code integration.
+/// Applications remain completely isolated while accessing platform services.
 #[derive(Debug)]
-pub struct ApplicationManager {
-    running_applications: RwLock<HashMap<Uuid, ApplicationProcess>>,
-    application_registry: ApplicationRegistry,
-    isolation_manager: Arc<IsolationManager>,
+pub struct GUIApplicationFramework {
+    application_launcher: ApplicationLauncher,
+    ipc_coordinator: ApplicationIPC,
+    isolation_enforcer: ApplicationIsolationEnforcer,
 }
 
+/// Desktop service manager coordinating platform services
+/// 
+/// Manages system-wide desktop services that applications can access
+/// through controlled interfaces while maintaining isolation boundaries.
 #[derive(Debug)]
-struct ApplicationProcess {
+pub struct DesktopServiceManager {
+    notification_service: Arc<NotificationService>,
+    clipboard_service: Arc<ClipboardService>,
+    audio_service: Arc<AudioService>,
+    file_service: Arc<DesktopFileService>,
+}
+
+/// Application isolation enforcement for desktop platform
+/// 
+/// Ensures that applications connecting to the platform operate within
+/// complete isolation boundaries and cannot interfere with each other
+/// or access unauthorized platform services.
+#[derive(Debug)]
+struct ApplicationIsolationEnforcer {
+    active_applications: RwLock<HashMap<Uuid, ConnectedApplication>>,
+    isolation_boundaries: HashMap<Uuid, ApplicationBoundary>,
+}
+
+/// Information about applications connected to the platform
+/// 
+/// Tracks applications that have established IPC connections with the
+/// platform while maintaining their isolation boundaries.
+#[derive(Debug, Clone)]
+struct ConnectedApplication {
     app_id: Uuid,
     process_id: u32,
     isolation_boundary: Uuid,
-    window_handles: Vec<WindowHandle>,
+    ipc_channels: Vec<GUIChannel>,
+    connection_time: DateTime<Utc>,
 }
 
-#[derive(Debug)]
-struct ApplicationRegistry {
-    installed_apps: HashMap<String, ApplicationMetadata>,
-}
-
-#[derive(Debug, Clone)]
-struct ApplicationMetadata {
-    pub app_name: String,
-    pub executable_path: String,
-    pub isolation_requirements: IsolationRequirements,
-    pub permissions: ApplicationPermissions,
-}
-
-#[derive(Debug, Clone)]
-struct IsolationRequirements {
-    pub memory_isolation: bool,
-    pub storage_isolation: bool,
-    pub network_isolation: bool,
-}
-
-#[derive(Debug, Clone)]
-struct ApplicationPermissions {
-    pub storage_access: Vec<String>,
-    pub network_access: Vec<String>,
-    pub hardware_access: Vec<HardwarePermission>,
-}
-
-#[derive(Debug, Clone)]
-enum HardwarePermission {
-    Camera,
-    Microphone,
-    USB,
-    Display,
-}
-
-#[derive(Debug)]
-struct WindowHandle {
-    window_id: Uuid,
-    window_surface: Surface,
-}
-
-#[derive(Debug, Clone)]
-struct GUIConfiguration {
+/// GUI platform configuration for desktop operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GUIConfiguration {
     pub platform_config: PlatformConfiguration,
     pub window_config: WindowConfiguration,
     pub theme_config: ThemeConfiguration,
-    pub application_config: ApplicationConfiguration,
+    pub service_config: ServiceConfiguration,
 }
 
-#[derive(Debug, Clone)]
-struct WindowConfiguration {
-    pub compositing_enabled: bool,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformConfiguration {
     pub hardware_acceleration: bool,
     pub multi_monitor_support: bool,
+    pub isolation_enforcement: bool,
 }
 
-#[derive(Debug, Clone)]
-struct ThemeConfiguration {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowConfiguration {
+    pub compositing_enabled: bool,
+    pub window_animation: bool,
+    pub window_shadows: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThemeConfiguration {
     pub theme_name: String,
     pub dark_mode: bool,
     pub high_contrast: bool,
+    pub font_scaling: f32,
 }
 
-#[derive(Debug, Clone)]
-struct ApplicationConfiguration {
-    pub auto_isolation: bool,
-    pub permission_prompts: bool,
-    pub application_verification: bool,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceConfiguration {
+    pub notifications_enabled: bool,
+    pub clipboard_isolation: bool,
+    pub audio_isolation: bool,
 }
 
 impl GUIPlatformRuntime {
-    /// Initialize GUI platform from kernel runtime
+    /// Initialize GUI platform runtime with desktop services
+    /// 
+    /// Creates the complete desktop environment including window management,
+    /// graphics coordination, and platform services. Applications will
+    /// connect to this runtime through IPC rather than direct integration.
     pub async fn initialize(kernel: Arc<KernelRuntime>) -> AnyhowResult<Self> {
-        info!("Initializing CIBOS-GUI platform");
+        info!("Initializing CIBOS-GUI platform runtime");
 
         // Load GUI platform configuration
         let config = GUIConfiguration::load_default().await
             .context("GUI platform configuration loading failed")?;
 
         // Initialize graphics and window management
-        let event_loop = EventLoop::new()
-            .context("Failed to create graphics event loop")?;
-
-        let window_manager = Arc::new(WindowManager::initialize(&event_loop, &config.window_config).await
+        let window_manager = Arc::new(WindowManager::initialize(&config.window_config).await
             .context("Window manager initialization failed")?);
 
         // Initialize desktop environment
         let desktop_environment = Arc::new(DesktopEnvironment::initialize(&window_manager, &config).await
             .context("Desktop environment initialization failed")?);
 
-        // Initialize application management
-        let application_manager = Arc::new(ApplicationManager::initialize(&kernel, &config.application_config).await
-            .context("Application manager initialization failed")?);
+        // Initialize application framework for IPC connections
+        let application_framework = Arc::new(GUIApplicationFramework::initialize(&kernel, &config).await
+            .context("Application framework initialization failed")?);
 
-        // Initialize GUI security management
-        let security_manager = Arc::new(SecurityManager::initialize_gui(&kernel).await
-            .context("GUI security manager initialization failed")?);
+        // Initialize desktop services
+        let desktop_services = Arc::new(DesktopServiceManager::initialize(&config.service_config).await
+            .context("Desktop service manager initialization failed")?);
 
-        info!("CIBOS-GUI platform initialization completed");
+        info!("CIBOS-GUI platform runtime initialization completed");
 
         Ok(Self {
             window_manager,
             desktop_environment,
-            application_manager,
-            security_manager,
+            application_framework,
+            desktop_services,
             kernel_interface: kernel,
             config,
         })
     }
 
-    /// Start GUI platform and desktop environment
+    /// Start GUI platform and enter desktop event loop
+    /// 
+    /// Begins providing desktop services and enters the main event loop
+    /// that handles window management, user input, and application IPC
+    /// communication while maintaining isolation boundaries.
     pub async fn run(&self, event_loop: EventLoop<()>) -> AnyhowResult<()> {
-        info!("Starting CIBOS-GUI desktop environment");
+        info!("Starting CIBOS-GUI desktop platform");
 
-        // Start desktop services
-        self.start_desktop_services().await
-            .context("Failed to start desktop services")?;
+        // Start desktop platform services
+        self.start_platform_services().await
+            .context("Failed to start desktop platform services")?;
 
         // Authenticate user and establish desktop session
-        let user_session = self.authenticate_desktop_user().await
+        let desktop_session = self.authenticate_desktop_user().await
             .context("Desktop user authentication failed")?;
 
         // Load user desktop environment
-        self.load_user_desktop(&user_session).await
-            .context("Failed to load user desktop")?;
+        self.load_user_desktop_environment(&desktop_session).await
+            .context("Failed to load user desktop environment")?;
 
-        // Enter main GUI event loop
+        // Start application framework for IPC connections
+        self.application_framework.start_application_services().await
+            .context("Application framework startup failed")?;
+
+        // Enter main desktop platform event loop
         self.run_desktop_event_loop(event_loop).await
-            .context("Desktop event loop execution failed")?;
+            .context("Desktop platform event loop failed")?;
 
         Ok(())
     }
 
     /// Start desktop platform services
-    async fn start_desktop_services(&self) -> AnyhowResult<()> {
+    /// 
+    /// Initializes all platform services that applications can connect to
+    /// through IPC while maintaining complete isolation between services.
+    async fn start_platform_services(&self) -> AnyhowResult<()> {
         info!("Starting desktop platform services");
 
         // Start window management services
         self.window_manager.start_compositor().await
-            .context("Compositor startup failed")?;
+            .context("Window compositor startup failed")?;
 
         // Start desktop environment services
         self.desktop_environment.start_services().await
+            .context("Desktop environment services startup failed")?;
+
+        // Start desktop services for application access
+        self.desktop_services.start_all_services().await
             .context("Desktop services startup failed")?;
 
-        // Start application management services
-        self.application_manager.start_application_services().await
-            .context("Application services startup failed")?;
-
-        info!("All desktop services started successfully");
+        info!("All desktop platform services started successfully");
         Ok(())
     }
 
-    /// Authenticate user and create desktop session
+    /// Authenticate user and create isolated desktop session
+    /// 
+    /// Handles user authentication using available methods (USB keys, etc.)
+    /// and creates a completely isolated desktop session for the user.
     async fn authenticate_desktop_user(&self) -> AnyhowResult<DesktopSession> {
         info!("Starting desktop user authentication");
 
         // Detect USB key authentication devices
-        let usb_devices = self.security_manager.detect_usb_authentication_devices().await
+        let usb_devices = self.detect_usb_authentication_devices().await
             .context("USB authentication device detection failed")?;
 
         if usb_devices.is_empty() {
@@ -256,57 +279,80 @@ impl GUIPlatformRuntime {
         }
 
         // Authenticate with USB key device
-        let auth_result = self.security_manager.authenticate_usb_device(&usb_devices[0]).await
+        let auth_result = self.authenticate_usb_device(&usb_devices[0]).await
             .context("USB key authentication failed")?;
 
         // Create isolated desktop session
         let desktop_session = DesktopSession::create(
             auth_result.profile_id,
-            &self.application_manager.isolation_manager
+            &self.kernel_interface
         ).await.context("Desktop session creation failed")?;
 
         info!("Desktop user authentication successful");
         Ok(desktop_session)
     }
 
-    /// Load user desktop environment and applications
-    async fn load_user_desktop(&self, session: &DesktopSession) -> AnyhowResult<()> {
+    /// Load user desktop environment with profile-specific configuration
+    /// 
+    /// Configures the desktop environment based on user profile settings
+    /// while maintaining isolation boundaries for user data and preferences.
+    async fn load_user_desktop_environment(&self, session: &DesktopSession) -> AnyhowResult<()> {
         info!("Loading user desktop environment");
 
-        // Load user profile and preferences
-        let user_profile = self.security_manager.load_user_profile(session.profile_id).await
+        // Load user profile and desktop preferences
+        let user_profile = self.load_user_profile(session.profile_id).await
             .context("User profile loading failed")?;
 
-        // Configure desktop theme and layout
+        // Configure desktop theme and layout for user
         self.desktop_environment.apply_user_configuration(&user_profile).await
             .context("Desktop configuration application failed")?;
 
-        // Load user applications
-        self.application_manager.load_user_applications(&user_profile).await
-            .context("User application loading failed")?;
+        // Setup application framework for user session
+        self.application_framework.configure_for_user(&user_profile).await
+            .context("Application framework user configuration failed")?;
 
         info!("User desktop environment loaded successfully");
         Ok(())
     }
 
-    /// Main desktop event loop handling window management and applications
+    /// Main desktop platform event loop
+    /// 
+    /// Handles window management, user input, application IPC communication,
+    /// and desktop service coordination while maintaining isolation boundaries.
     async fn run_desktop_event_loop(&self, event_loop: EventLoop<()>) -> AnyhowResult<()> {
-        info!("Starting desktop event loop");
+        info!("Starting desktop platform event loop");
 
-        // Create event loop handler
-        let event_handler = DesktopEventHandler::new(
+        // Create platform event handler
+        let event_handler = DesktopPlatformEventHandler::new(
             self.window_manager.clone(),
-            self.application_manager.clone(),
+            self.application_framework.clone(),
+            self.desktop_services.clone(),
         );
 
-        // Run event loop - this blocks until desktop shutdown
+        // Run platform event loop - this coordinates the entire desktop
         event_loop.run_app(&mut event_handler)
-            .map_err(|e| anyhow::anyhow!("Desktop event loop error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Desktop platform event loop error: {}", e))?;
 
         Ok(())
     }
+
+    async fn detect_usb_authentication_devices(&self) -> AnyhowResult<Vec<USBAuthDevice>> {
+        // Detect USB authentication devices connected to system
+        todo!("Implement USB authentication device detection")
+    }
+
+    async fn authenticate_usb_device(&self, device: &USBAuthDevice) -> AnyhowResult<AuthenticationResult> {
+        // Authenticate using USB key device
+        todo!("Implement USB device authentication")
+    }
+
+    async fn load_user_profile(&self, profile_id: Uuid) -> AnyhowResult<DesktopProfile> {
+        // Load user profile with desktop-specific configuration
+        todo!("Implement user profile loading")
+    }
 }
 
+/// Desktop session for authenticated user
 #[derive(Debug)]
 pub struct DesktopSession {
     pub session_id: Uuid,
@@ -316,9 +362,9 @@ pub struct DesktopSession {
 }
 
 impl DesktopSession {
-    async fn create(profile_id: Uuid, isolation: &IsolationManager) -> AnyhowResult<Self> {
+    async fn create(profile_id: Uuid, kernel: &KernelRuntime) -> AnyhowResult<Self> {
         let session_id = Uuid::new_v4();
-        let isolation_boundary = isolation.create_desktop_session_boundary(session_id).await?;
+        let isolation_boundary = kernel.create_desktop_session_boundary(session_id).await?;
 
         Ok(Self {
             session_id,
@@ -329,28 +375,42 @@ impl DesktopSession {
     }
 }
 
-/// Desktop event handler for window and application events
-struct DesktopEventHandler {
-    window_manager: Arc<WindowManager>,
-    application_manager: Arc<ApplicationManager>,
+#[derive(Debug)]
+struct USBAuthDevice {
+    device_id: String,
+    capabilities: Vec<String>,
 }
 
-impl DesktopEventHandler {
+use shared::types::authentication::AuthenticationResult;
+
+/// Desktop platform event handler coordinating all platform events
+/// 
+/// Manages window events, application IPC messages, and desktop service
+/// coordination while maintaining isolation boundaries between all components.
+struct DesktopPlatformEventHandler {
+    window_manager: Arc<WindowManager>,
+    application_framework: Arc<GUIApplicationFramework>,
+    desktop_services: Arc<DesktopServiceManager>,
+}
+
+impl DesktopPlatformEventHandler {
     fn new(
         window_manager: Arc<WindowManager>,
-        application_manager: Arc<ApplicationManager>,
+        application_framework: Arc<GUIApplicationFramework>,
+        desktop_services: Arc<DesktopServiceManager>,
     ) -> Self {
         Self {
             window_manager,
-            application_manager,
+            application_framework,
+            desktop_services,
         }
     }
 }
 
-impl ApplicationHandler for DesktopEventHandler {
+impl ApplicationHandler for DesktopPlatformEventHandler {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        // Handle desktop resume events
-        info!("Desktop environment resumed");
+        info!("Desktop platform resumed");
+        // Handle platform resume events
     }
 
     fn window_event(
@@ -380,30 +440,20 @@ impl ApplicationHandler for DesktopEventHandler {
 // PUBLIC GUI PLATFORM INTERFACE EXPORTS
 // =============================================================================
 
-// GUI platform runtime exports
+// Platform runtime exports (NOT application exports)
 pub use crate::window_manager::{WindowManager, DesktopEnvironment, Compositor};
-pub use crate::framework::{GUIApplication, ApplicationManager, ApplicationLifecycle};
-pub use crate::ui::{WidgetSystem, ThemeManager, LayoutEngine, EventDispatcher};
+pub use crate::ui::{WidgetFramework, ThemeManager, LayoutEngine, EventDispatcher};
+pub use crate::services::{DesktopServiceManager, NotificationService, ClipboardService, AudioService};
+pub use crate::framework::{GUIApplicationFramework, ApplicationIPC, ApplicationLauncher};
 
-// Desktop application exports
-pub use crate::apps::{
-    InstallerApplication, TerminalApplication, FileManagerApplication,
-    WebBrowserApplication, TextEditorApplication, PackageManagerApplication,
-    SettingsApplication
-};
-
-// Desktop service exports
-pub use crate::services::{DesktopService, NotificationService, ClipboardService, AudioService};
-
-// Shared type re-exports for GUI platform integration
+// Shared type re-exports for platform integration
 pub use shared::types::hardware::DisplayCapabilities;
 pub use shared::types::isolation::GUIIsolationLevel;
 pub use shared::types::authentication::GUIAuthenticationMethod;
 pub use shared::types::profiles::DesktopProfile;
 
-/// Module declarations for GUI platform components
-pub mod window_manager;
+/// Module declarations for GUI platform components (NOT applications)
+pub mod window_manager; 
 pub mod ui;
-pub mod apps;
 pub mod services;
 pub mod framework;
