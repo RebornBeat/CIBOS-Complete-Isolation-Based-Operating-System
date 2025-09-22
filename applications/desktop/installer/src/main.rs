@@ -1,7 +1,13 @@
 // =============================================================================
-// DESKTOP INSTALLER APPLICATION - cibos/applications/desktop/installer/src/main.rs
+// CIBOS DESKTOP INSTALLER APPLICATION - cibos/applications/desktop/installer/src/main.rs
 // Installer Application Executable Entry Point
 // =============================================================================
+
+//! CIBOS Desktop Installer Application Entry Point
+//! 
+//! This executable provides both GUI and CLI modes for installing
+//! CIBIOS firmware and CIBOS operating system with complete verification
+//! and hardware compatibility checking.
 
 // External runtime dependencies
 use anyhow::{Context, Result as AnyhowResult};
@@ -9,33 +15,19 @@ use log::{debug, error, info, warn, LevelFilter};
 use env_logger::Builder as LogBuilder;
 use tokio::runtime::Runtime as TokioRuntime;
 use clap::{Arg, Command, ArgMatches};
-use winit::event_loop::EventLoop;
+use std::env;
 
 // CIBOS installer library imports
 use cibos_installer::{InstallerApplication, InstallationWizard, FirmwareFlasher};
-use cibos_installer::ui::{InstallerWindow, WizardNavigation, ProgressWindow};
-use cibos_installer::firmware_flash::{FlashingEngine, HardwareFlasher, VerificationEngine};
-use cibos_installer::verification::{SystemVerifier, ComponentVerifier, IntegrityChecker};
+use cibos_installer::{InstallationConfiguration, HardwareConfiguration, InstallationResult};
 
-// CIBOS platform integration
-use cibos_platform_gui::{GUIApplication, WindowManager, ApplicationManager};
-use cibos_platform_gui::framework::application::{GUIApplicationRunner, ApplicationConfiguration};
-
-// Kernel communication
-use cibos_kernel::core::ipc::{ApplicationChannel, SystemServiceInterface};
-use cibos_kernel::security::authorization::{AdminPermissions, SystemModification};
-
-// Hardware integration
-use cibios::{HardwareAbstraction, FirmwareConfiguration};
-
-// Configuration imports
-use shared::types::config::{InstallerConfiguration, FlashingConfiguration, VerificationConfiguration};
-use shared::types::hardware::{TargetHardware, FlashingTarget, VerificationTarget};
-use shared::types::authentication::{InstallerCredentials, AdminAuthentication};
+// Shared imports for installer functionality
+use shared::types::hardware::{HardwarePlatform, ProcessorArchitecture};
 use shared::types::error::{InstallerError, ApplicationError, FlashingError};
 
 /// Entry point for CIBOS installer application
-fn main() -> AnyhowResult<()> {
+#[tokio::main]
+async fn main() -> AnyhowResult<()> {
     // Initialize logging for installer application
     LogBuilder::from_default_env()
         .filter_level(LevelFilter::Info)
@@ -46,16 +38,16 @@ fn main() -> AnyhowResult<()> {
     // Parse installer command line arguments
     let cli_args = parse_installer_arguments();
 
-    // Create async runtime for installer operation
-    let runtime = TokioRuntime::new()
-        .context("Failed to create installer async runtime")?;
+    // Initialize installer application
+    let mut installer = InstallerApplication::initialize().await
+        .context("Installer application initialization failed")?;
 
-    // Run installer main logic
-    runtime.block_on(installer_async_main(cli_args))
-        .context("Installer execution failed")?;
-
-    info!("CIBOS installer completed successfully");
-    Ok(())
+    // Determine execution mode based on arguments
+    if cli_args.get_flag("gui") {
+        run_gui_installer(&mut installer, cli_args).await
+    } else {
+        run_cli_installer(&mut installer, cli_args).await
+    }
 }
 
 /// Parse installer application command line arguments
@@ -88,40 +80,28 @@ fn parse_installer_arguments() -> ArgMatches {
                 .action(clap::ArgAction::SetTrue)
                 .help("Verify installation after completion")
         )
+        .arg(
+            Arg::new("platform")
+                .long("platform")
+                .value_name("PLATFORM")
+                .help("Target platform (desktop, mobile, server)")
+        )
         .get_matches()
-}
-
-/// Main installer logic coordination
-async fn installer_async_main(args: ArgMatches) -> AnyhowResult<()> {
-    info!("Starting installer main logic");
-
-    // Connect to CIBOS kernel for system access
-    let kernel_channel = connect_to_kernel().await
-        .context("Kernel connection for installer failed")?;
-
-    // Initialize installer application
-    let mut installer = InstallerApplication::initialize(kernel_channel).await
-        .context("Installer application initialization failed")?;
-
-    // Check if GUI mode was requested
-    if args.get_flag("gui") {
-        run_gui_installer(&mut installer, args).await
-    } else {
-        run_cli_installer(&mut installer, args).await
-    }
 }
 
 /// Run graphical installer interface
 async fn run_gui_installer(installer: &mut InstallerApplication, args: ArgMatches) -> AnyhowResult<()> {
     info!("Starting graphical installer interface");
 
-    // Create GUI event loop
-    let event_loop = EventLoop::new()
-        .context("Failed to create installer event loop")?;
-
     // Run installation process with GUI
-    installer.run_installation().await
+    let installation_result = installer.run_installation().await
         .context("GUI installation process failed")?;
+
+    if installation_result.firmware_installed && installation_result.os_installed {
+        info!("GUI installation completed successfully");
+    } else {
+        return Err(anyhow::anyhow!("GUI installation failed - check logs for details"));
+    }
 
     Ok(())
 }
@@ -137,33 +117,48 @@ async fn run_cli_installer(installer: &mut InstallerApplication, args: ArgMatche
     // Configure installation options
     let backup_enabled = args.get_flag("backup");
     let verification_enabled = args.get_flag("verify");
+    let platform = args.get_one::<String>("platform")
+        .map(|p| parse_platform_string(p))
+        .unwrap_or(HardwarePlatform::Desktop);
 
-    // Run CLI installation process
+    // Create installation configuration
     let install_config = InstallationConfiguration {
         target_device: target_device.clone(),
         backup_existing: backup_enabled,
         verify_installation: verification_enabled,
         create_recovery: true,
+        target_platform: platform,
     };
 
-    let result = installer.run_cli_installation(&install_config).await
+    info!("CLI installation configuration: target={}, backup={}, verify={}, platform={:?}", 
+          target_device, backup_enabled, verification_enabled, platform);
+
+    // Run CLI installation process
+    let result = installer.run_installation().await
         .context("CLI installation process failed")?;
 
     if result.firmware_installed && result.os_installed {
-        info!("Installation completed successfully");
+        info!("CLI installation completed successfully");
     } else {
-        return Err(anyhow::anyhow!("Installation failed - check logs for details"));
+        return Err(anyhow::anyhow!("CLI installation failed - check logs for details"));
     }
 
     Ok(())
 }
 
-/// Connect to CIBOS kernel for installer system access
-async fn connect_to_kernel() -> AnyhowResult<Arc<SystemServiceChannel>> {
-    info!("Connecting installer to CIBOS kernel");
-
-    let kernel_channel = cibos_kernel::ipc::connect_application_to_kernel("cibos-installer").await
-        .context("Failed to establish kernel connection for installer")?;
-
-    Ok(Arc::new(kernel_channel))
+/// Parse platform string to HardwarePlatform enum
+fn parse_platform_string(platform_str: &str) -> HardwarePlatform {
+    match platform_str.to_lowercase().as_str() {
+        "desktop" => HardwarePlatform::Desktop,
+        "laptop" => HardwarePlatform::Laptop,
+        "mobile" => HardwarePlatform::Mobile,
+        "tablet" => HardwarePlatform::Tablet,
+        "server" => HardwarePlatform::Server,
+        "embedded" => HardwarePlatform::Embedded,
+        _ => {
+            warn!("Unknown platform '{}', defaulting to Desktop", platform_str);
+            HardwarePlatform::Desktop
+        }
+    }
 }
+
