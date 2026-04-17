@@ -110,64 +110,134 @@ CIBOS intentionally avoids FIFO queues, priority queues, and fair scheduling gua
 
 ## RTRO: Real-Time Resource Obfuscation
 
-### Embedded Timing Obfuscation at Execution Level
+### Behavioral Obfuscation Layer Running Alongside Execution
 
-RTRO (Real-Time Resource Obfuscation) is integrated directly into execution, providing micro-level, embedded noise that operates at low-level execution granularity and is always active.
+RTRO (Real-Time Resource Obfuscation) is a kernel-integrated behavioral obfuscation layer that operates alongside execution to confuse external observation of system behavior. RTRO randomizes reported metrics and observable signals without modifying actual execution timing or introducing artificial delays.
+
+**Core Principle:**
+The system executes normally. Only what can be observed externally about execution is obfuscated.
 
 **What RTRO Does:**
-- Introduces micro-level, embedded noise into execution timing
-- Operates at low-level execution granularity
-- Remains always active (never disabled)
+- Operates as an obfuscation layer that intercepts and transforms externally visible system signals
+- Randomizes reported CPU usage, memory patterns, and I/O timing appearance
+- Obscures container activity attribution in system interfaces
+- Blurs correlation between observed signals and specific container activity
+- Runs alongside execution at the kernel boundary without touching execution itself
 
-**Key Characteristics:**
-- Not external padding that creates detectable patterns
-- Not artificial delays that hurt performance
-- Not interval-based timing injection that can be statistically filtered
-- Not signal flattening that introduces deliberate task delays
-- Embedded into real execution activity as natural variation
-
-**RTRO vs Traditional Obfuscation:**
-
-| Approach | Traditional Systems | CIBOS RTRO |
-|----------|---------------------|------------|
-| Method | Add delays, padding, coarse randomization | Micro-noise blended into execution |
-| Patterns | Fixed intervals, detectable | No fixed intervals |
-| Performance | Degradation from delays | Minimal overhead, no task delays |
-| Effectiveness | Can be statistically filtered | Statistically obfuscated |
-| Task Treatment | Some systems delay short tasks artificially | No artificial task delays |
-
-### What RTRO Does NOT Do
-
-RTRO is designed to avoid patterns that could themselves become signals:
-
-**RTRO Does NOT:**
-- Introduce artificial delays to short tasks
-- Mask or extend long tasks deliberately
+**What RTRO Does NOT Do:**
+- Introduce artificial delays to any tasks
+- Modify actual CPU execution timing
 - Attempt to make all executions look statistically similar
 - Trade performance for obfuscation
 - Create resource starvation through padding
+- Delay short tasks or mask long tasks deliberately
 
-**Why This Matters:**
-- Artificial delays would consume resources unnecessarily
-- Making executions "look similar" would starve short tasks
-- Performance degradation would itself become an observable pattern
-- Natural variation is more effective than forced uniformity
+### RTRO Architecture: Where It Sits
+
+RTRO lives inside the kernel at event boundaries:
+
+```
+[ Container ]
+     ↓
+[ Kernel Arbitration ]
+     ↓
+[ RTRO Layer (Obfuscation) ]
+     ↓
+[ Observable Outputs / Interfaces ]
+```
+
+RTRO activates:
+- When execution is scheduled
+- When metrics are exposed
+- When state could be inferred
+- At all system interface boundaries
+
+### What RTRO Obfuscates
+
+**Software-Visible Metrics (Fully Controllable):**
+- CPU usage per container (reported values are randomized)
+- Memory usage reports (actual allocation hidden)
+- Process lists and container visibility
+- Scheduler state visibility
+- System API responses about container activity
+
+**Kernel-Level Observability (Fully Controllable):**
+- Which container appears active in reports
+- Execution attribution in logs and metrics
+- Event sequencing visibility
+- Container activity indicators
+
+**Inter-Container Visibility (Fully Controllable):**
+Containers cannot see:
+- Other containers' activity
+- Scheduling decisions affecting other containers
+- Execution ordering of other containers
+- Resource allocation of other containers
+
+### What RTRO Cannot Fully Hide
+
+**Hardware-Level Signals:**
+
+An attacker with sufficient capability can still observe:
+- Cache timing differences
+- Branch prediction behavior
+- Power consumption patterns
+- Memory bus contention
+
+These are outside the kernel's full control and represent hardware-level side channels.
+
+### Why CIBOS Still Works Despite Hardware Leakage
+
+Because CIBOS removed:
+- Shared state between containers
+- Global coordination mechanisms
+- Deterministic scheduling
+- Observable retry patterns
+- Visible ordering
+
+Even if hardware leaks something:
+> There is no structured signal to correlate it with.
+
+### The Strongest Argument for RTRO
+
+Traditional systems leak:
+- *What* is happening
+- *When* it happens
+- *In what order*
+
+CIBOS + RTRO:
+- Hides *what* (no metadata exposure)
+- Obscures *when* (RTRO + non-deterministic arbitration)
+- Destroys *order* (entropy-based scheduling)
+
+Attackers get:
+> **Noise without structure**
+
+### RTRO vs Traditional Obfuscation
+
+| Approach | Traditional Systems | CIBOS RTRO |
+|----------|---------------------|------------|
+| Method | Add delays, padding, forced uniformity | Behavioral obfuscation alongside execution |
+| Execution | Modified (slowed down) | Unchanged (no performance penalty) |
+| Patterns | Fixed intervals become detectable | No artificial patterns introduced |
+| Performance | Degraded | Minimal overhead only |
+| Effectiveness | Can be filtered statistically | Correlation broken, not just obscured |
 
 ### Elastic RTRO Behavior
 
-RTRO adapts to system load conditions without introducing delays:
+RTRO adapts to system load conditions:
 
-- **Low Load:** Minimal noise, maximum performance
-- **Medium Load:** Moderate noise for balance
-- **High Load:** Structured noise maintained (not reduced) because high load = highest attack surface
+- **Low Load:** Minimal obfuscation complexity, maximum performance
+- **Medium Load:** Moderate obfuscation for balance
+- **High Load:** Full obfuscation maintained (highest attack surface requires strongest protection)
 
 ### Non-Time-Based Backoff
 
-When stalling occurs, CIBOS uses event-driven retry triggers rather than time-based backoff:
+When stalling occurs, CIBOS uses event-driven retry triggers:
 - Retry on resource release events
-- Retry on randomized kernel ticks (not time intervals)
+- Retry on randomized kernel events (not time intervals)
 - This removes timing leakage from the retry mechanism itself
-- No artificial delays inserted between retries
+- No artificial delays inserted anywhere in the system
 
 ---
 
@@ -191,11 +261,12 @@ Attackers see:
 - No shared contention points
 - No observable retry patterns
 - No deterministic ordering
-- Execution timing with embedded micro-noise via RTRO
+- Execution behavior obscured by RTRO behavioral obfuscation
 - No artificial delays that create patterns
+- Correlation points removed between observable signals
 
 **Combined Effect:**
-Execution timing is obfuscated through embedded micro-noise without performance degradation, and behavioral correlation becomes extremely difficult, making timing attacks and side-channel exploitation significantly harder than in traditional systems.
+Execution behavior is obfuscated through RTRO's behavioral obfuscation layer running alongside execution, and behavioral correlation becomes extremely difficult because structured signals have been removed, making timing attacks and side-channel exploitation significantly harder than in traditional systems.
 
 ---
 
@@ -299,13 +370,28 @@ CIBOS provides mathematical security guarantees through isolation architecture t
 
 ### CIBIOS Firmware-Enforced Isolation Boundaries
 
-CIBIOS firmware provides isolation boundaries that cannot be bypassed through software attacks while maintaining optimal performance through firmware-level acceleration of isolation mechanisms. Firmware-enforced isolation operates independently of software security systems while providing isolation effectiveness.
+CIBIOS firmware provides isolation boundaries that resist software-based attacks and provide strong boundaries against compromised operating system components while maintaining optimal performance through firmware-level acceleration of isolation mechanisms. Firmware-enforced isolation operates independently of software security systems while providing isolation effectiveness against software-based threats.
 
 **Memory Protection Enforcement:** CIBIOS memory management provides guarantees about memory boundaries that prevent applications from accessing memory used by other applications while enabling optimal memory utilization through predictable allocation patterns.
 
 **Process Isolation Enforcement:** CIBIOS process management prevents applications from interfering with execution of other applications while enabling optimal CPU utilization through firmware-accelerated process switching that maintains isolation boundaries.
 
 **I/O Isolation Enforcement:** CIBIOS I/O management provides guarantees about I/O isolation that prevent applications from accessing I/O resources used by other applications while enabling optimal I/O performance through isolated resource management.
+
+### Hardware-Level Considerations
+
+**What CIBIOS Protects Against:**
+- Software-based attacks from Ring 0/EL1
+- Compromised operating system components
+- Software exploitation of isolation boundaries
+- Software-based behavioral profiling
+
+**What CIBIOS Cannot Prevent:**
+- Hardware-level surveillance mechanisms (Intel ME, AMD PSP) that operate below firmware level
+- Hardware vulnerabilities in the processor itself
+- Physical tampering with hardware components
+
+**Note:** Hardware-level surveillance mechanisms such as Intel Management Engine and AMD Platform Security Processor operate below firmware level and are not preventable by software. CIBIOS native isolation provides strong protection against software-based attacks while being transparent about hardware-level limitations.
 
 ---
 
