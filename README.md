@@ -7,7 +7,9 @@ The Complete Isolation-Based Operating System (CIBOS) represents the world's fir
 
 CIBOS solves the fundamental access problem in privacy computing. When GrapheneOS requires expensive Pixel phones, when privacy-focused Linux distributions demand high-end hardware, and when secure operating systems work only on specific devices, billions of people using older smartphones or budget computers remain vulnerable to surveillance and privacy violations. CIBOS transforms this dynamic by providing superior privacy protection on any device while eliminating the artificial hardware requirements that exclude most users from privacy protection.
 
-The revolutionary insight underlying CIBOS is that proper isolation architecture eliminates trust relationships that create both privacy vulnerabilities and performance bottlenecks in traditional operating systems. When system components operate in complete mathematical isolation rather than trust-based coordination, the system achieves privacy guarantees that remain effective even when hardware components include surveillance capabilities or backdoors that compromise traditional security approaches.
+The revolutionary insight underlying CIBOS is that proper isolation architecture eliminates trust relationships that create both privacy vulnerabilities and performance bottlenecks in traditional operating systems. When system components operate in complete isolation rather than trust-based coordination, the system achieves privacy guarantees that remain effective even when hardware components include surveillance capabilities or backdoors that compromise traditional security approaches.
+
+CIBOS runs on top of CIBIOS, which provides the hardware-level isolation foundation. CIBOS builds the operating environment, application isolation, user profiles, and security guarantees on top of what CIBIOS establishes. Both implement the Hybrid Isolation Paradigm's cryptographic communication mode, appropriate for a system that serves multiple users and may operate in networked environments.
 
 ---
 
@@ -21,7 +23,7 @@ Windows uses a hybrid approach that combines microkernel and monolithic characte
 
 CIBOS eliminates these fundamental problems by implementing complete component isolation where each system service operates as an independent process with its own memory space, resource allocation, and security boundary enforced by CIBIOS firmware-level isolation mechanisms. Device drivers run in isolated containers that cannot access system memory or interfere with other drivers. File systems operate as isolated services that applications access through secure communication channels. Network stacks run in isolation that prevents network-based attacks from affecting other system components.
 
-The microkernel provides mathematical guarantees about isolation effectiveness through CIBIOS firmware-enforced boundaries that cannot be bypassed through software vulnerabilities or sophisticated attacks. Unlike software-only isolation that can be compromised, CIBIOS firmware-enforced isolation creates boundaries that remain effective even when individual components are compromised or when hardware includes surveillance capabilities.
+The microkernel provides guarantees about isolation effectiveness through CIBIOS firmware-enforced boundaries that cannot be bypassed through software vulnerabilities or sophisticated attacks. Unlike software-only isolation that can be compromised, CIBIOS firmware-enforced isolation creates boundaries that remain effective even when individual components are compromised or when hardware includes surveillance capabilities.
 
 ---
 
@@ -31,515 +33,257 @@ The microkernel provides mathematical guarantees about isolation effectiveness t
 
 CIBOS fundamentally eliminates global locks and shared-state coordination, addressing the root cause of timing attacks and side-channel vulnerabilities rather than merely mitigating them. This represents a paradigm shift from traditional operating system design where coordination mechanisms inherently create observable behavior patterns.
 
-**Traditional Systems Create Observable Behavior:**
-- Threads wait on locks with predictable wake-up ordering (often FIFO or priority-based)
-- Resource contention creates measurable timing patterns
-- Shared memory exposes indirect signals between processes
-- Lock acquisition patterns reveal workload characteristics
+Traditional systems create observable behavior through threads waiting on locks with predictable ordering, resource contention creating measurable timing patterns, shared memory exposing indirect signals between processes, and lock acquisition patterns revealing workload characteristics.
 
-**CIBOS Eliminates These Attack Surfaces:**
-- No global locks across the entire system
-- No shared state between containers
-- No deterministic ordering guarantees (no FIFO unless explicitly enabled per-application)
-- No user-visible retry loops
-- No time-based backoff mechanisms
+CIBOS eliminates these attack surfaces through no global locks across the entire system, no shared state between containers, no deterministic ordering guarantees at the system level, no user-visible retry loops, and no time-based backoff mechanisms at the kernel coordination level.
 
-### Kernel Arbitration Model: Catch & Release Execution
+### Kernel Arbitration Model: Event-Driven Execution
 
-Instead of lock acquisition, CIBOS uses kernel-controlled execution gating:
+Instead of lock acquisition, CIBOS uses kernel-controlled execution gating. When a container attempts execution and capacity is available, execution proceeds immediately. When capacity is full, the container is stalled without spinning and without retrying. When resources become available, the kernel emits an event signal and selects applicable stalled containers for execution resumption using entropy-based arbitration.
 
-1. A container attempts execution
-2. If capacity is available: Execution proceeds immediately
-3. If capacity is full: The container is stalled (not spinning, not retrying)
-4. When resources become available: The kernel emits an event signal and selects applicable stalled containers for execution resumption
-
-This model provides:
-- No active retry loop that creates timing signals
-- No polling that consumes CPU cycles
-- No user-controlled retry timing that could be exploited
-- Retry is entirely kernel-issued and event-driven
+This model provides no active retry loop that creates timing signals, no polling that consumes CPU cycles and creates observable patterns, no user-controlled retry timing that could be exploited, and retry that is entirely kernel-issued and event-driven.
 
 ### Lane-Based FIFO Architecture
 
-CIBOS implements application-level FIFO through a lane-based architecture that preserves parallelism while maintaining isolation:
+CIBOS implements application-level ordering through a lane-based architecture that preserves parallelism while maintaining isolation.
 
-**Container Level:**
-- Each container can have multiple parallel lanes
-- Each lane maintains its own optional FIFO ordering
-- Internal ordering is fully private within each lane
-- No container is reduced to a single exposed event
+At the container level, each container can have multiple parallel lanes. Each lane maintains its own optional FIFO ordering. Internal ordering is fully private within each lane. No container is reduced to a single exposed event.
 
-**Kernel Level:**
-- Sees only current head events per active lane
-- No knowledge of internal queue structures
-- No visibility into queue depth or future events
-- Arbitrates across containers and lanes independently
+At the kernel level, the kernel sees only the current head event per active lane. The kernel has no knowledge of internal queue structures, no visibility into queue depth or future events, and arbitrates across containers and lanes independently using entropy.
 
-**Ephemeral Ordering:**
-- Kernel maintains only an ephemeral ordering of currently visible events
-- Not a global queue or persistent ordering structure
-- Ordering is local and cannot be reconstructed globally
-- Each event is treated as stateless and independent
+Ordering within lanes is ephemeral. The kernel maintains only an ephemeral ordering of currently visible events. This is not a global queue and not a persistent ordering structure. Ordering is local and cannot be reconstructed globally by any observer. Each event is treated as stateless and independent.
 
-### Kernel Constraints for Safe Arbitration
+The kernel is architecturally constrained from seeing inside lanes. It sees the head event and nothing else. This constraint prevents any component from inferring system state from kernel behavior.
 
-To maintain security and prevent ordering leakage:
+### System-Wide Non-Deterministic Arbitration
 
-**Kernel MUST NOT:**
-- Peek ahead into container queues
-- Know queue lengths
-- Batch events from the same container deterministically
-- Maintain persistent ordering relationships
-
-**Kernel SHOULD:**
-- Treat each event as stateless and independent
-- Re-evaluate arbitration after every execution
-- Avoid deterministic patterns in selection
-- Select from independent, single-step candidates
-
-### No System-Wide Ordering Guarantees
-
-CIBOS intentionally avoids FIFO queues, priority queues, and fair scheduling guarantees at the system level because ordering itself is a signal that attackers can exploit:
-
-**Why This Matters:**
-- In traditional systems, order = information and queue position = system insight
-- In CIBOS, execution order is non-deterministic and based on applicability, resource compatibility, and kernel arbitration logic
-- Ordering exists locally within lanes, but cannot be reconstructed globally
+CIBOS intentionally avoids FIFO queues, priority queues, and deterministic scheduling guarantees at the system level because ordering itself is a signal. In traditional systems, queue position reveals information about system state. In CIBOS, execution order is non-deterministic at the system level and based on entropy-based arbitration among available events. Ordering exists locally within lanes but cannot be reconstructed globally.
 
 ---
 
 ## RTRO: Real-Time Resource Obfuscation
 
-### Behavioral Obfuscation Layer Running Alongside Execution
+### Behavioral Obfuscation Running Alongside Execution
 
-RTRO (Real-Time Resource Obfuscation) is a kernel-integrated behavioral obfuscation layer that operates alongside execution to confuse external observation of system behavior. RTRO randomizes reported metrics and observable signals without modifying actual execution timing or introducing artificial delays.
+RTRO is a kernel-integrated behavioral obfuscation layer that operates alongside execution to confuse external observation of system behavior. RTRO randomizes reported metrics and observable signals without modifying actual execution timing or introducing artificial delays.
 
-**Core Principle:**
-The system executes normally. Only what can be observed externally about execution is obfuscated.
+The core principle is that the system executes normally, and only what can be observed externally about execution is obfuscated.
 
-**What RTRO Does:**
-- Operates as an obfuscation layer that intercepts and transforms externally visible system signals
-- Randomizes reported CPU usage, memory patterns, and I/O timing appearance
-- Obscures container activity attribution in system interfaces
-- Blurs correlation between observed signals and specific container activity
-- Runs alongside execution at the kernel boundary without touching execution itself
+RTRO operates at the kernel boundary to intercept observable signals, randomizes reported CPU usage, memory patterns, and event attribution in system interfaces, obscures container activity attribution, blurs correlation between observed signals and specific container activity, and runs alongside execution without touching execution itself.
 
-**What RTRO Does NOT Do:**
-- Introduce artificial delays to any tasks
-- Modify actual CPU execution timing
-- Attempt to make all executions look statistically similar
-- Trade performance for obfuscation
-- Create resource starvation through padding
-- Delay short tasks or mask long tasks deliberately
+RTRO does not introduce artificial delays, does not modify actual CPU execution timing, does not force all executions to look statistically similar, does not trade performance for obfuscation, and does not create resource starvation through padding.
 
-### RTRO Architecture: Where It Sits
+### Why RTRO Is Present in CIBOS
 
-RTRO lives inside the kernel at event boundaries:
+RTRO is present in CIBOS because CIBOS serves multi-user systems in potentially networked environments. In these environments, an adversarial observer may exist who could attempt to correlate behavioral signals between containers, across users, or with external timing references. RTRO makes this correlation extremely difficult by removing structured behavioral signals from the observable output of the system.
 
-```
-[ Container ]
-     ↓
-[ Kernel Arbitration ]
-     ↓
-[ RTRO Layer (Obfuscation) ]
-     ↓
-[ Observable Outputs / Interfaces ]
-```
+### Where RTRO Operates
 
-RTRO activates:
-- When execution is scheduled
-- When metrics are exposed
-- When state could be inferred
-- At all system interface boundaries
+RTRO lives inside the kernel at event boundaries, between kernel arbitration and observable outputs and interfaces. RTRO activates when execution is scheduled, when metrics are exposed, when state could be inferred, and at all system interface boundaries.
 
 ### What RTRO Obfuscates
 
-**Software-Visible Metrics (Fully Controllable):**
-- CPU usage per container (reported values are randomized)
-- Memory usage reports (actual allocation hidden)
-- Process lists and container visibility
-- Scheduler state visibility
-- System API responses about container activity
+RTRO fully controls software-visible metrics including CPU usage per container, memory usage reports, process lists and container visibility, scheduler state visibility, and system API responses about container activity.
 
-**Kernel-Level Observability (Fully Controllable):**
-- Which container appears active in reports
-- Execution attribution in logs and metrics
-- Event sequencing visibility
-- Container activity indicators
+RTRO fully controls kernel-level observability including which container appears active in reports, execution attribution in logs and metrics, event sequencing visibility, and container activity indicators.
 
-**Inter-Container Visibility (Fully Controllable):**
-Containers cannot see:
-- Other containers' activity
-- Scheduling decisions affecting other containers
-- Execution ordering of other containers
-- Resource allocation of other containers
+Containers cannot see other containers' activity, scheduling decisions affecting other containers, execution ordering of other containers, or resource allocation of other containers.
 
 ### What RTRO Cannot Fully Hide
 
-**Hardware-Level Signals:**
+Hardware-level signals including cache timing differences, branch prediction behavior, power consumption patterns, and memory bus contention remain outside the kernel's full control and represent hardware-level side channels. CIBIOS and CIBOS minimize the structured information available at these channels through the elimination of global locks and shared state, but cannot eliminate hardware physics.
 
-An attacker with sufficient capability can still observe:
-- Cache timing differences
-- Branch prediction behavior
-- Power consumption patterns
-- Memory bus contention
-
-These are outside the kernel's full control and represent hardware-level side channels.
-
-### Why CIBOS Still Works Despite Hardware Leakage
-
-Because CIBOS removed:
-- Shared state between containers
-- Global coordination mechanisms
-- Deterministic scheduling
-- Observable retry patterns
-- Visible ordering
-
-Even if hardware leaks something:
-> There is no structured signal to correlate it with.
-
-### The Strongest Argument for RTRO
-
-Traditional systems leak:
-- *What* is happening
-- *When* it happens
-- *In what order*
-
-CIBOS + RTRO:
-- Hides *what* (no metadata exposure)
-- Obscures *when* (RTRO + non-deterministic arbitration)
-- Destroys *order* (entropy-based scheduling)
-
-Attackers get:
-> **Noise without structure**
-
-### RTRO vs Traditional Obfuscation
-
-| Approach | Traditional Systems | CIBOS RTRO |
-|----------|---------------------|------------|
-| Method | Add delays, padding, forced uniformity | Behavioral obfuscation alongside execution |
-| Execution | Modified (slowed down) | Unchanged (no performance penalty) |
-| Patterns | Fixed intervals become detectable | No artificial patterns introduced |
-| Performance | Degraded | Minimal overhead only |
-| Effectiveness | Can be filtered statistically | Correlation broken, not just obscured |
+The strongest argument for CIBOS's combined architecture is that traditional systems leak what is happening, when it happens, and in what order. CIBOS with RTRO hides what through no metadata exposure, obscures when through RTRO combined with non-deterministic arbitration, and destroys order through entropy-based scheduling. Attackers receive noise without structure.
 
 ### Elastic RTRO Behavior
 
-RTRO adapts to system load conditions:
-
-- **Low Load:** Minimal obfuscation complexity, maximum performance
-- **Medium Load:** Moderate obfuscation for balance
-- **High Load:** Full obfuscation maintained (highest attack surface requires strongest protection)
-
-### Non-Time-Based Backoff
-
-When stalling occurs, CIBOS uses event-driven retry triggers:
-- Retry on resource release events
-- Retry on randomized kernel events (not time intervals)
-- This removes timing leakage from the retry mechanism itself
-- No artificial delays inserted anywhere in the system
-
----
-
-## Why This Eliminates Lock-Based Leakage
-
-### In Traditional Systems
-
-Attackers observe:
-- Wait times revealing contention
-- Lock acquisition patterns
-- Execution ordering
-
-This enables:
-- Behavioral inference about other processes
-- Cross-process observation attacks
-- Side-channel exploitation
-
-### In CIBOS
-
-Attackers see:
-- No shared contention points
-- No observable retry patterns
-- No deterministic ordering
-- Execution behavior obscured by RTRO behavioral obfuscation
-- No artificial delays that create patterns
-- Correlation points removed between observable signals
-
-**Combined Effect:**
-Execution behavior is obfuscated through RTRO's behavioral obfuscation layer running alongside execution, and behavioral correlation becomes extremely difficult because structured signals have been removed, making timing attacks and side-channel exploitation significantly harder than in traditional systems.
+At low load, RTRO operates at baseline obfuscation complexity with maximum performance. At medium load, RTRO provides moderate obfuscation for balance. At high load, full obfuscation is maintained because high load represents the highest attack surface and requires the strongest protection.
 
 ---
 
 ## Platform-Specific Variants: Optimized for Purpose
 
-CIBOS provides three distinct variants optimized for specific use cases while maintaining identical isolation guarantees and privacy protection across all platforms. This approach ensures each variant carries only necessary components without bloating systems with unused functionality.
+CIBOS provides three distinct variants optimized for specific use cases while maintaining identical isolation guarantees and privacy protection across all platforms.
 
 ### CIBOS-CLI: Command Line Interface for Servers and Embedded Systems
 
-CIBOS-CLI provides optimal performance and minimal resource utilization for server deployments, embedded systems, IoT devices, and power-user scenarios where graphical interfaces represent unnecessary overhead. CLI implementation demonstrates superior performance and security characteristics compared to traditional command-line systems while maintaining complete isolation guarantees.
+CIBOS-CLI provides optimal performance and minimal resource utilization for server deployments, embedded systems, IoT devices, and power-user scenarios where graphical interfaces represent unnecessary overhead.
 
-**Server Environment Optimization:** CIBOS-CLI enables deployment in data centers, cloud infrastructure, and enterprise server environments where isolation characteristics provide significant advantages over traditional server operating systems. Server optimization includes support for high-performance networking, large memory configurations, and multi-processor systems while eliminating unnecessary services and background processes that consume resources without providing server functionality.
+**Server Environment Optimization:** CIBOS-CLI enables deployment in data centers, cloud infrastructure, and enterprise server environments with support for high-performance networking, large memory configurations, and multi-processor systems while eliminating unnecessary services.
 
-**Embedded and IoT Device Support:** CIBOS-CLI operates effectively on resource-constrained devices including single-board computers, industrial control systems, and IoT devices where minimal resource utilization and maximum reliability are essential. Embedded optimization enables privacy protection on devices that traditionally lack comprehensive security features while preventing embedded devices from becoming surveillance platforms.
+**Embedded and IoT Device Support:** CIBOS-CLI operates effectively on resource-constrained devices including single-board computers, industrial control systems, and IoT devices, enabling privacy protection on devices that traditionally lack comprehensive security features.
 
-**Edge Computing Integration:** CIBOS-CLI provides optimal performance for edge computing scenarios where privacy protection and isolation characteristics enable secure distributed computing while maintaining minimal resource overhead. Edge optimization includes support for intermittent connectivity, local processing optimization, and secure coordination with other edge systems.
+**Edge Computing Integration:** CIBOS-CLI provides optimal performance for edge computing scenarios with support for intermittent connectivity, local processing optimization, and secure coordination.
 
 ### CIBOS-GUI: Desktop Computing with Privacy Protection
 
-CIBOS-GUI provides comprehensive desktop computing functionality through isolated graphical interface components that enable productivity applications while maintaining complete isolation between applications and preventing any application from monitoring user interface activities from other applications.
+CIBOS-GUI provides comprehensive desktop computing functionality through isolated graphical interface components that enable productivity applications while maintaining complete isolation between applications.
 
-**Desktop Application Framework:** CIBOS-GUI supports productivity applications including document editors, web browsers, media applications, and development tools while ensuring applications operate in complete isolation that prevents applications from monitoring user activities or accessing unauthorized data from other applications or system components.
+**Desktop Application Framework:** CIBOS-GUI supports productivity applications including document editors, web browsers, media applications, and development tools while ensuring applications operate in complete isolation.
 
-**Window Management Isolation:** Window management operates through isolated components that prevent applications from monitoring window activities from other applications while enabling efficient window organization and desktop productivity. Window isolation ensures applications cannot determine what other applications are running or observe user interaction patterns with other applications.
+**Window Management Isolation:** Window management operates through isolated components that prevent applications from monitoring window activities from other applications. Applications cannot determine what other applications are running or observe user interaction patterns.
 
-**Graphics and Input Isolation:** Graphics system isolation prevents applications from accessing graphics resources used by other applications while enabling optimal performance through hardware acceleration when available. Input system isolation prevents applications from monitoring keyboard, mouse, or other input intended for other applications while enabling responsive input handling.
+**Graphics and Input Isolation:** Graphics system isolation prevents applications from accessing graphics resources used by other applications. Input system isolation prevents applications from monitoring keyboard, mouse, or other input intended for other applications.
 
 ### CIBOS-MOBILE: Smartphone and Tablet Privacy Protection
 
 CIBOS-MOBILE provides comprehensive mobile device functionality that exceeds privacy protection available from iOS or Android while maintaining compatibility with mobile applications and providing optimal performance on mobile hardware including older devices that manufacturers no longer support.
 
-**Touch Interface Optimization:** Touch interface provides responsive input handling while maintaining complete isolation between applications and preventing any application from monitoring touch activities intended for other applications. Touch isolation operates through isolated management components that provide optimal responsiveness while preventing unauthorized input monitoring.
+**Touch Interface Optimization:** Touch interface provides responsive input handling while maintaining complete isolation between applications. Touch isolation prevents any application from monitoring touch activities intended for other applications.
 
-**Mobile Privacy Profiles:** CIBOS-MOBILE implements comprehensive privacy profile management that enables users to create distinct usage contexts for different activities while maintaining complete isolation between profiles. Privacy profiles include work profiles isolated from personal profiles, temporary profiles for specific activities, and secure profiles for sensitive communications.
+**Mobile Privacy Profiles:** CIBOS-MOBILE implements comprehensive privacy profile management enabling users to create distinct usage contexts for different activities while maintaining complete isolation between profiles.
 
-**Connectivity and Sensor Isolation:** Mobile connectivity including Wi-Fi, cellular, and Bluetooth operates through isolated management that prevents applications from monitoring connectivity patterns or accessing unauthorized network information. Camera, microphone, GPS, and other sensors require explicit user authorization for each access while preventing unauthorized sensor monitoring or data collection.
+**Connectivity and Sensor Isolation:** Mobile connectivity including Wi-Fi, cellular, and Bluetooth operates through isolated management. Camera, microphone, GPS, and other sensors require explicit user authorization for each access while preventing unauthorized sensor monitoring.
 
-**Power and Performance Optimization:** Battery life optimization operates through elimination of background processes, telemetry systems, and surveillance capabilities that consume power without providing user benefits. Power optimization includes intelligent resource management that provides improved battery life compared to traditional mobile operating systems while maintaining complete isolation and privacy protection.
+**Power and Performance Optimization:** Battery life optimization operates through elimination of background processes, telemetry systems, and surveillance capabilities that consume power without providing user benefits.
 
 ---
 
 ## Universal Hardware Compatibility: Privacy for Everyone
 
-CIBOS implements universal compatibility across all processor architectures and device types through adaptive optimization that provides consistent privacy protection regardless of device cost, age, or capabilities. Universal compatibility operates through intelligent resource management that scales privacy protection to match hardware constraints while ensuring budget devices receive privacy protection that exceeds expensive devices running compromised operating systems.
+CIBOS implements universal compatibility across all processor architectures and device types through adaptive optimization that provides consistent privacy protection regardless of device cost, age, or capabilities.
 
 ### ARM Architecture Universal Support
 
-ARM processor support enables CIBOS deployment across mobile devices, embedded systems, single-board computers, and ARM-based desktop systems while leveraging ARM-specific capabilities for optimal performance and power efficiency.
+ARM processor support enables CIBOS deployment across mobile devices, embedded systems, single-board computers, and ARM-based desktop systems.
 
-**Mobile Device Compatibility:** CIBOS-MOBILE operates on smartphones and tablets including older Android devices that manufacturers no longer support, extending device lifetime while providing privacy protection compared to systems running outdated Android versions with known security vulnerabilities.
+**Mobile Device Compatibility:** CIBOS-MOBILE operates on smartphones and tablets including older Android devices that manufacturers no longer support, extending device lifetime.
 
-**Embedded System Integration:** CIBOS-CLI enables deployment in IoT devices, industrial control systems, and embedded platforms where privacy protection prevents devices from becoming surveillance platforms while maintaining necessary functionality and optimal resource utilization.
+**Embedded System Integration:** CIBOS-CLI enables deployment in IoT devices, industrial control systems, and embedded platforms.
 
-**Single-Board Computer Support:** CIBOS enables privacy-focused computing on affordable platforms including Raspberry Pi devices that provide desktop computing functionality at minimal cost while achieving privacy protection that exceeds expensive desktop systems running traditional operating systems.
+**Single-Board Computer Support:** CIBOS enables privacy-focused computing on affordable platforms providing privacy protection exceeding expensive desktop systems running traditional operating systems.
 
 ### x86 and x64 Architecture Comprehensive Support
 
-Intel and AMD processor support provides CIBOS compatibility across desktop computers, laptops, and server systems while maintaining universal compatibility across processor generations and price ranges.
+Intel and AMD processor support provides CIBOS compatibility across desktop computers, laptops, and server systems.
 
-**Desktop and Laptop Optimization:** CIBOS-GUI enables privacy-focused desktop computing with security characteristics compared to Windows, macOS, or traditional Linux distributions while maintaining compatibility with existing desktop hardware including older systems that cannot run modern Windows versions.
+**Desktop and Laptop Optimization:** CIBOS-GUI enables privacy-focused desktop computing while maintaining compatibility with existing desktop hardware including older systems.
 
-**Server Platform Integration:** CIBOS-CLI enables enterprise server deployment where isolation characteristics provide significant security and reliability advantages over traditional server operating systems while maintaining compatibility with existing server hardware and enterprise infrastructure.
+**Server Platform Integration:** CIBOS-CLI enables enterprise server deployment with isolation characteristics providing significant security and reliability advantages.
 
-**Legacy Hardware Support:** CIBOS operates effectively on older x86 and x64 systems that traditional operating systems no longer support, extending hardware lifetime while providing security and privacy protection compared to unsupported systems running outdated operating systems.
+**Legacy Hardware Support:** CIBOS operates effectively on older x86 and x64 systems, extending hardware lifetime.
 
 ### RISC-V Open Architecture Foundation
 
-RISC-V processor support ensures CIBOS compatibility with emerging open-source processor architectures while providing development foundations for future processor designs that complement CIBOS isolation architecture without requiring proprietary security features or vendor-controlled hardware capabilities.
+RISC-V processor support ensures CIBOS compatibility with emerging open-source processor architectures.
 
 ---
 
 ## Privacy Protection Through Mathematical Isolation
 
-CIBOS implements comprehensive privacy protection through architectural design that makes privacy violations architecturally difficult rather than policy violations that can be bypassed. Privacy protection operates through systematic isolation that prevents any component from accessing information outside its explicit authorization scope while maintaining optimal system functionality.
+CIBOS implements comprehensive privacy protection through architectural design that makes privacy violations architecturally difficult. Privacy protection operates through systematic isolation that prevents any component from accessing information outside its explicit authorization scope.
 
 ### Data Compartmentalization Architecture
 
-User data remains confined to specific isolated components with access controls enforced by isolation boundaries while maintaining necessary data access for authorized applications. Data compartmentalization operates through isolated management that prevents unauthorized data access while enabling optimal performance for authorized operations.
+**File System Isolation:** Each application receives its own view of user data including only explicitly authorized files while preventing applications from discovering or accessing unauthorized files.
 
-**File System Isolation:** Each application receives its own view of user data that includes only explicitly authorized files while preventing applications from discovering or accessing unauthorized files. File system isolation operates through isolated management that prevents compromise from affecting other applications while providing optimal file access performance.
+**Memory Isolation:** Applications cannot access memory used by other applications. Dedicated memory resources cannot be observed or interfered with by other applications or system components.
 
-**Memory Isolation:** Applications cannot access memory used by other applications while enabling optimal memory utilization through isolated management that provides dedicated memory resources that cannot be observed or interfered with by other applications or system components.
-
-**Communication Isolation:** Applications cannot monitor communication between other applications while enabling authorized inter-application communication through isolated channels that provide necessary functionality while maintaining privacy protection.
+**Communication Isolation:** Applications cannot monitor communication between other applications while authorized inter-application communication occurs through isolated channels.
 
 ### Behavioral Privacy Protection
 
-CIBOS prevents any component from building profiles of user behavior through observation of application usage patterns, system resource utilization, or temporal behavior characteristics while maintaining system functionality that enables productive computing experiences.
+**Application Usage Isolation:** Applications cannot monitor usage patterns from other applications.
 
-**Application Usage Isolation:** Applications cannot monitor usage patterns from other applications while enabling necessary functionality without compromising user privacy. Usage isolation operates through isolated management that prevents usage monitoring while providing optimal application performance.
+**Resource Usage Isolation:** Applications cannot monitor system resource utilization patterns that could reveal user behavior.
 
-**Resource Usage Isolation:** Applications cannot monitor system resource utilization patterns that could reveal user behavior while enabling optimal resource utilization through isolated management that provides predictable resource allocation without revealing usage patterns.
-
-**Metadata Protection:** System metadata including process lists, file system organization, network configuration, and hardware characteristics cannot be accessed by unauthorized components while enabling necessary system operation. Metadata protection operates through isolated management that prevents metadata access while providing necessary functionality.
+**Metadata Protection:** System metadata including process lists, file system organization, network configuration, and hardware characteristics cannot be accessed by unauthorized components. RTRO further obscures what is observable at system interfaces.
 
 ---
 
-## Security Through Mathematical Guarantees
-
-CIBOS provides mathematical security guarantees through isolation architecture that creates security boundaries enforced by CIBIOS firmware mechanisms. Mathematical security operates through verification of isolation properties under specific threat models while maintaining optimal performance across diverse hardware platforms.
+## Security Through Isolation Guarantees
 
 ### CIBIOS Firmware-Enforced Isolation Boundaries
 
-CIBIOS firmware provides isolation boundaries that resist software-based attacks and provide strong boundaries against compromised operating system components while maintaining optimal performance through firmware-level acceleration of isolation mechanisms. Firmware-enforced isolation operates independently of software security systems while providing isolation effectiveness against software-based threats.
+CIBIOS firmware provides isolation boundaries that resist software-based attacks and provide strong boundaries against compromised operating system components.
 
-**Memory Protection Enforcement:** CIBIOS memory management provides guarantees about memory boundaries that prevent applications from accessing memory used by other applications while enabling optimal memory utilization through predictable allocation patterns.
+**Memory Protection Enforcement:** CIBIOS memory management provides guarantees about memory boundaries that prevent applications from accessing memory used by other applications.
 
-**Process Isolation Enforcement:** CIBIOS process management prevents applications from interfering with execution of other applications while enabling optimal CPU utilization through firmware-accelerated process switching that maintains isolation boundaries.
+**Process Isolation Enforcement:** CIBIOS process management prevents applications from interfering with execution of other applications.
 
-**I/O Isolation Enforcement:** CIBIOS I/O management provides guarantees about I/O isolation that prevent applications from accessing I/O resources used by other applications while enabling optimal I/O performance through isolated resource management.
+**I/O Isolation Enforcement:** CIBIOS I/O management provides guarantees about I/O isolation that prevent applications from accessing I/O resources used by other applications.
 
-### Hardware-Level Considerations
+### What CIBIOS Protects Against and What It Cannot Prevent
 
-**What CIBIOS Protects Against:**
-- Software-based attacks from Ring 0/EL1
-- Compromised operating system components
-- Software exploitation of isolation boundaries
-- Software-based behavioral profiling
+**CIBIOS Protects Against:** Software-based attacks from Ring 0 or equivalent privilege levels, compromised operating system components, software exploitation of isolation boundaries, and software-based behavioral profiling.
 
-**What CIBIOS Cannot Prevent:**
-- Hardware-level surveillance mechanisms (Intel ME, AMD PSP) that operate below firmware level
-- Hardware vulnerabilities in the processor itself
-- Physical tampering with hardware components
-
-**Note:** Hardware-level surveillance mechanisms such as Intel Management Engine and AMD Platform Security Processor operate below firmware level and are not preventable by software. CIBIOS native isolation provides strong protection against software-based attacks while being transparent about hardware-level limitations.
-
----
-
-## Application Development Framework
-
-CIBOS provides comprehensive application development support through isolated development environments and deployment frameworks that enable efficient application development while maintaining isolation guarantees throughout the development and deployment process.
-
-### Native CIBOS Application Development
-
-Application development utilizes standard programming languages including C, C++, Rust, Python, and JavaScript while gaining automatic security and privacy benefits through the isolation architecture. Applications automatically receive privacy protection and security benefits without requiring special programming techniques or security-focused development practices.
-
-**Isolated Development Environments:** Development tools operate in isolation that prevents development activities from accessing unauthorized system resources while enabling optimal development productivity through isolated toolchain management that eliminates development environment interference.
-
-**Automatic Security Benefits:** Applications automatically gain security and privacy protection through CIBOS isolation architecture without requiring developers to implement security measures or privacy protection mechanisms that would require additional development effort on traditional systems.
-
-**Performance Optimization Integration:** Applications automatically receive performance benefits through isolation architecture that eliminates interference patterns while enabling developers to focus on application functionality rather than system-level optimization or security implementation.
-
-### Container Deployment and Management
-
-Applications deploy through isolated containers that provide automatic security and privacy protection while enabling optimal performance through dedicated resource allocation and elimination of application interference patterns.
-
----
-
-## Implementation Roadmap and Development Strategy
-
-CIBOS development follows systematic phases that validate theoretical foundations through practical implementation while building comprehensive operating system functionality across all supported platforms and deployment scenarios.
-
-### Phase 1: Core Microkernel and Isolation Implementation (Months 1-12)
-
-Core microkernel development establishes foundational architecture including memory management, process scheduling, and inter-process communication while validating isolation mechanisms across supported processor architectures and hardware platforms.
-
-**Microkernel Architecture:** Core kernel implements minimal functionality including memory management with CIBIOS-enforced isolation, process scheduling with isolation guarantees, and secure inter-process communication that enables isolated component coordination.
-
-**CIBIOS Integration:** Microkernel integrates with CIBIOS firmware to utilize firmware-enforced isolation boundaries while providing consistent functionality across diverse hardware platforms and processor architectures.
-
-**Multi-Architecture Support:** Core implementation supports ARM, x86, x64, and RISC-V processor architectures while maintaining consistent functionality and isolation guarantees across all supported platforms.
-
-### Phase 2: System Services and Platform Variants (Months 10-20)
-
-System services development implements isolated components for file systems, network management, and device drivers while developing platform-specific variants optimized for different deployment scenarios.
-
-**Isolated System Services:** File system services, network management, and device drivers operate in complete isolation while providing standard functionality through isolated implementation that prevents service compromise from affecting other system components.
-
-**CIBOS-CLI Development:** Command-line interface variant optimized for servers, embedded systems, and power-user scenarios while demonstrating performance and security characteristics compared to traditional command-line systems.
-
-**CIBOS-GUI Development:** Graphical interface variant provides desktop computing functionality while maintaining complete isolation between applications and preventing interface-based privacy violations or security compromises.
-
-**CIBOS-MOBILE Development:** Mobile variant provides smartphone and tablet functionality that exceeds privacy protection available from traditional mobile operating systems while maintaining optimal performance on mobile hardware.
-
-### Phase 3: Application Framework and Performance Optimization (Months 18-28)
-
-Application framework development provides comprehensive development and deployment support while implementing performance optimization that demonstrates isolation architecture advantages over traditional operating system approaches.
-
-**Native Application Framework:** Development framework provides efficient application development while maintaining isolation guarantees and automatic security benefits for applications developed within the CIBOS ecosystem.
-
-**Performance Enhancement:** System-wide performance optimization demonstrates that isolation architecture provides performance characteristics compared to traditional systems while maintaining privacy guarantees and security properties.
-
-**Community Development Framework:** Open-source development infrastructure enables community collaboration while maintaining security and privacy standards appropriate for production deployment across diverse usage scenarios.
-
-### Phase 4: Production Validation and Ecosystem Development (Months 26-36)
-
-Production validation provides comprehensive testing and community ecosystem development that enables widespread CIBOS adoption while maintaining security and privacy characteristics across diverse deployment scenarios and user communities.
-
-**Security Validation:** Comprehensive security testing including independent security analysis validates isolation guarantees while ensuring production-ready security characteristics.
-
-**Community Ecosystem:** Development community infrastructure and collaboration frameworks enable effective community participation while maintaining security and privacy standards across diverse contributor backgrounds and expertise levels.
-
-**Production Deployment:** Comprehensive deployment preparation enables widespread CIBOS adoption across diverse hardware platforms and usage scenarios while maintaining consistent security and privacy protection.
+**CIBIOS Cannot Prevent:** Hardware-level surveillance mechanisms that operate below firmware level, hardware vulnerabilities in the processor itself, and physical tampering with hardware components.
 
 ---
 
 ## Comparison with Existing Operating Systems
 
-CIBOS transcends traditional operating system limitations through isolation architecture that eliminates fundamental security and privacy vulnerabilities while achieving performance characteristics. Comparison analysis demonstrates that CIBOS provides advances over existing approaches.
-
 ### Linux Distribution Limitations
 
-Linux distributions provide broad functionality while implementing security through complex configuration that requires substantial expertise to achieve basic protection. Linux security depends on correct configuration of access controls and ongoing maintenance that most users cannot effectively manage while providing incomplete protection against sophisticated attacks.
-
-CIBOS provides security through architectural design that eliminates configuration complexity while providing isolation guarantees that exceed expert Linux configurations. Security operates through isolation architecture rather than complex configuration management that creates opportunities for misconfiguration and security vulnerabilities.
+Linux security depends on correct configuration of access controls and ongoing maintenance that most users cannot effectively manage while providing incomplete protection against sophisticated attacks. CIBOS provides security through architectural design that eliminates configuration complexity.
 
 ### Windows Operating System Problems
 
-Windows provides broad application compatibility while implementing security through complex mechanisms that create substantial attack surfaces and privacy vulnerabilities including telemetry systems that monitor user behavior for corporate surveillance rather than user benefit.
-
-CIBOS provides security through isolation architecture that eliminates attack surfaces and privacy vulnerabilities while providing performance through elimination of background telemetry and surveillance systems that consume resources without providing user benefits.
+Windows implements security through complex mechanisms creating substantial attack surfaces and privacy vulnerabilities including telemetry systems that monitor user behavior for corporate purposes. CIBOS provides security through isolation architecture that eliminates attack surfaces and surveillance overhead.
 
 ### macOS Ecosystem Limitations
 
-macOS provides integrated user experience while implementing security through vendor-controlled mechanisms that depend on Apple ecosystem control rather than isolation guarantees that users can verify and control independently.
-
-CIBOS provides security through isolation guarantees that users control rather than vendor policies while enabling deployment across all hardware platforms rather than expensive Apple-specific hardware that creates digital divides.
+macOS implements security through vendor-controlled mechanisms that depend on Apple ecosystem control rather than isolation guarantees that users can verify independently. CIBOS provides security through guarantees that users control rather than vendor policies.
 
 ### GrapheneOS Hardware Limitations
 
-GrapheneOS provides enhanced Android security while remaining limited to expensive Pixel devices that exclude most users from privacy protection. GrapheneOS demonstrates security improvements while illustrating access limitations that prevent widespread privacy protection.
-
-CIBOS provides security across all hardware platforms while eliminating hardware compatibility limitations that prevent universal privacy protection. Privacy protection works on budget hardware rather than creating digital divides where privacy becomes a luxury for wealthy users.
+GrapheneOS provides enhanced Android security while remaining limited to expensive Pixel devices that exclude most users from privacy protection. CIBOS provides security across all hardware platforms while eliminating hardware compatibility limitations.
 
 ---
 
-## Future Research: Quantum-Like Classical Computing Integration
+## Implementation Roadmap and Development Strategy
 
-### Pathway to Non-Binary Computing Paradigms
+### Phase 1: Core Microkernel and Isolation Implementation (Months 1 to 12)
 
-CIBOS is designed with future evolution in mind, anticipating the transition from binary to non-binary computing architectures. The isolation-first design philosophy positions CIBOS as an ideal foundation for quantum-inspired classical computing systems that achieve quantum-like computational benefits without requiring extreme environmental conditions or error-prone quantum hardware.
+Core microkernel development establishes foundational architecture including memory management, process scheduling, and inter-process communication while validating isolation mechanisms across supported processor architectures. CIBIOS integration provides firmware-enforced isolation boundaries and consistent functionality across diverse hardware platforms and processor architectures.
 
-### Temporal-Analog Processing Potential
+### Phase 2: System Services and Platform Variants (Months 10 to 20)
 
-The CIBOS architecture's elimination of global locks and shared-state coordination creates a foundation compatible with temporal-analog processing approaches that can implement:
-- Quantum-like superposition through parallel temporal patterns
-- Quantum-like entanglement through temporal correlations between processing elements
-- Probabilistic computation with explicit uncertainty quantification
+Isolated system services development implements file systems, network management, and device drivers operating in complete isolation. CIBOS-CLI, CIBOS-GUI, and CIBOS-MOBILE development proceeds with platform-specific optimizations while maintaining identical isolation guarantees.
 
-### Hardware Evolution Readiness
+### Phase 3: Application Framework and Performance Optimization (Months 18 to 28)
 
-The mathematical isolation model at CIBOS's core is hardware-agnostic, designed to operate identically across current binary architectures while remaining compatible with future non-binary chip designs. This forward-looking architecture ensures that investments in CIBOS development and deployment will remain relevant as computing hardware evolves.
+Native application framework development provides efficient application development while maintaining isolation guarantees. System-wide performance optimization demonstrates isolation architecture performance characteristics. Open-source development infrastructure enables community collaboration.
+
+### Phase 4: Production Validation and Ecosystem Development (Months 26 to 36)
+
+Comprehensive security testing and independent security analysis validates isolation guarantees. Production deployment preparation enables widespread CIBOS adoption across diverse hardware platforms.
+
+---
+
+## Future Research: Transition to Non-Binary Computing
+
+### CIBOS as Foundation for Evolving Computation
+
+CIBOS is designed with future evolution in mind, anticipating the transition from binary to non-binary computing architectures. The isolation-first design philosophy positions CIBOS as an ideal foundation for computing systems that move beyond binary logic, whether toward analog processing, event-analog substrates, or other non-binary approaches.
+
+### Architecture as the Constant
+
+The mathematical isolation model at CIBOS's core is hardware-agnostic. It operates identically across current binary architectures while remaining compatible with future non-binary chip designs. Isolation boundaries, event-driven coordination, and lane-based execution remain valid regardless of the underlying computational substrate.
 
 ### Research Directions
 
-Future research areas for CIBOS include:
-- Integration with neuromorphic and memristive computing substrates
-- Implementation of spike-timing-dependent processing models
-- Development of probabilistic programming interfaces that leverage uncertainty quantification
-- Exploration of room-temperature quantum-like superposition implementations
+Future research areas include integration with non-binary computing substrates, implementation of probabilistic programming interfaces that leverage non-binary computation, development of uncertainty quantification in system services, and exploration of parallel pathway processing in non-binary hardware.
 
 ### Language Evolution Considerations
 
-While CIBOS is currently implemented in Rust for binary architectures, the system architecture is designed to be language-agnostic at the isolation boundary level. Future research will explore:
-- Non-binary programming paradigms optimized for temporal-analog computation
-- Hardware description languages for custom non-binary processors
-- Transition pathways from binary Rust implementations to non-binary equivalents
+CIBOS is currently implemented in Rust for binary architectures. The system architecture is designed to be language-agnostic at the isolation boundary level. Future research will explore non-binary programming paradigms optimized for alternative substrates, hardware description languages for custom non-binary processors, and transition pathways from current binary Rust implementations to non-binary equivalents as appropriate hardware becomes available.
 
 ---
 
 ## Conclusion: Universal Privacy Through Democratic Technology
 
-CIBOS represents fundamental transformation in operating system design that transcends traditional limitations through systematic application of mathematical isolation principles while democratizing privacy protection across all hardware platforms and economic circumstances. By demonstrating that architectural design provides security and privacy independent of hardware cost, CIBOS establishes possibilities for universal privacy protection that serves all users.
+CIBOS represents fundamental transformation in operating system design that transcends traditional limitations through systematic application of isolation principles while democratizing privacy protection across all hardware platforms and economic circumstances.
 
-The operating system demonstrates that privacy protection and performance can coexist while enabling rather than constraining system functionality through isolation architecture that eliminates trade-offs that have limited traditional operating system development. CIBOS demonstrates that mathematical security guarantees and performance characteristics can be achieved simultaneously through proper architectural design.
-
-Through universal compatibility and adaptive optimization, CIBOS enables privacy protection for everyone rather than creating digital divides where privacy becomes a luxury for wealthy users with expensive hardware. The operating system represents democratic technology that empowers all users with privacy protection while enabling technological development that enhances human autonomy and dignity.
+The operating system demonstrates that privacy protection and performance can coexist while enabling rather than constraining system functionality through isolation architecture that eliminates coordination trade-offs. Privacy protection works on budget hardware rather than creating digital divides where privacy becomes a luxury for wealthy users.
 
 ---
 
-**Project Repository:** [github.com/cibos/complete-isolation-os](https://github.com/cibos/complete-isolation-os)
+**Project Repository:** github.com/cibos/complete-isolation-os
 
-**Documentation:** [docs.cibos.org](https://docs.cibos.org) | **Community:** [community.cibos.org](https://community.cibos.org)
+**Documentation:** docs.cibos.org
+
+**Community:** community.cibos.org
 
 **Development Status:** Core architecture implementation phase
 
@@ -548,3 +292,222 @@ Through universal compatibility and adaptive optimization, CIBOS enables privacy
 **Supported Architectures:** ARM, x64, x86, RISC-V with universal compatibility
 
 **License:** Privacy-focused open source with strong copyleft protections
+
+---
+
+# QIBIOS: Quantum-Inspired Basic Input/Output System
+**Lightweight Boot Firmware for Quantum-Like Computing Platforms**
+
+## Overview
+
+The Quantum-Inspired Basic Input/Output System (QIBIOS) is a lightweight boot firmware designed for systems optimized for quantum-like classical computation. Implementing the Hybrid Isolation Paradigm's lightweight handshake communication mode, QIBIOS provides minimal-overhead boot and hardware initialization for systems where cryptographic verification overhead is unacceptable for the target workload, where physical security establishes the trust boundary, and where maximum performance from the first instruction is the design goal.
+
+QIBIOS boots and hands off to QIOS. These two systems are designed together. QIBIOS establishes the hardware foundation with minimal overhead; QIOS builds the execution environment on top of it. Both implement HIP's isolation principles in the lightweight handshake mode, appropriate for the air-gapped, single-user, physically secured environments where these systems operate.
+
+QIBIOS is not a simplified or inferior version of CIBIOS. It is an alternative firmware designed for a fundamentally different threat model and use case. Where CIBIOS serves multi-user networked environments requiring cryptographic verification chains, QIBIOS serves single-user offline environments requiring maximum performance and minimum initialization overhead.
+
+---
+
+## Design Philosophy: Performance Through Minimalism and Correct Threat Modeling
+
+### The Core Design Insight
+
+Security overhead exists to protect against adversaries. When no adversary exists—when the system is air-gapped, physically secured, and operated by a single trusted user—security overhead provides no benefit and pure cost. QIBIOS is designed for this threat model.
+
+This is not a security compromise. It is correct threat modeling. A cryptographic verification chain that protects against network-based attacks provides zero protection when the threat vector is physical. Physical security, verified boot media, and isolation architecture provide the actual protection in this environment.
+
+### Essential Functions Only
+
+QIBIOS implements only the absolute minimum required for boot and hardware initialization. No cryptographic verification layers, no multi-user support infrastructure, no network security features, no attestation chains, no measured boot sequences. Each of these would add overhead without providing security benefit in the target environment.
+
+### Hardware Trust Boundary
+
+Security in QIBIOS's deployment context is provided by physical access control and isolation boundaries, not cryptographic mechanisms. The firmware trusts the hardware and the physical environment.
+
+### Quantum-Like Optimization from the First Instruction
+
+Boot sequences and hardware initialization are optimized for the quantum-like computing workloads that QIOS will run. This means minimizing initialization latency, establishing isolation boundaries before any code executes, and configuring hardware state that QIOS's lane-based execution will immediately use.
+
+### HIP Lightweight Handshake Mode
+
+QIBIOS implements HIP's lightweight handshake communication mode. The handoff from QIBIOS to QIOS is a lightweight authenticated handshake, not a cryptographically signed and verified transaction. Trust is established through the physical environment, not through signatures.
+
+---
+
+## How QIBIOS Enables Quantum-Like Properties
+
+QIBIOS is not merely a fast bootloader. It establishes the hardware conditions that make QIOS's quantum-like computational properties possible.
+
+### No Global Locks from the Start
+
+Traditional firmware initialization uses sequential locked initialization steps. QIBIOS initializes hardware components through event-driven completion chains with no global synchronization points. This means QIOS inherits a system state where no global lock patterns have been established.
+
+### Isolation Boundaries Before Kernel Execution
+
+QIBIOS establishes hardware memory isolation boundaries before QIOS begins execution. QIOS does not request isolation—it is born into it. Lane memory regions are isolated at the hardware level before any QIOS code runs.
+
+### Event-Driven Initialization
+
+The boot sequence does not use fixed time delays. Each initialization step proceeds when its prerequisites are complete, signaled through event mechanisms. This event-driven pattern is established at firmware level and inherited by QIOS.
+
+### Parallel Hardware Initialization
+
+Where hardware components can initialize in parallel without semantic ordering requirements, QIBIOS initializes them concurrently. This reduces boot time and establishes the pattern of parallel independent operation that QIOS extends.
+
+---
+
+## Architecture
+
+### Boot Sequence: Event-Driven Initialization
+
+Each step proceeds when the previous step signals completion, not after a fixed time delay. Steps that have no semantic dependency on each other proceed in parallel. The total boot sequence time is minimized because no artificial delays are introduced anywhere.
+
+The sequence begins with hardware power stabilization, proceeds through memory controller initialization, processor feature configuration, storage detection, isolation boundary establishment, QIOS kernel loading, and handoff. Each transition is event-triggered.
+
+**Total Boot Time Target:** Under one second on modern hardware with fast storage.
+
+### Memory Model: Isolated Regions from Boot
+
+QIBIOS configures a simplified memory layout optimized for QIOS's lane architecture. Memory regions are isolated at the hardware level before QIOS begins execution. No shared memory regions exist between regions. Memory protection is configured before kernel load.
+
+The memory layout reserves a firmware region below the main application space, establishes the kernel region for QIOS, and provides the application memory space where QIOS will create lane regions for application execution.
+
+### Communication Model: Lightweight Handshake to QIOS
+
+QIBIOS hands off to QIOS through a minimal handshake. Boot parameters including detected hardware configuration, established memory layout, and initialization status are written to a known memory location. QIOS reads these parameters. No signatures are required. The isolation boundary between firmware and kernel is hardware-enforced, not cryptographically verified.
+
+---
+
+## Hardware Support
+
+### Supported Architectures
+
+**Primary Targets:**
+- x86_64 (Intel and AMD)
+- ARM64 (ARMv8 and later)
+- RISC-V (RV64GC)
+
+**Optimization Characteristics:**
+QIBIOS is optimized for hardware providing predictable execution timing, low-latency memory access, minimal interrupt latency, and hardware memory isolation mechanisms. These characteristics support QIOS's quantum-like computation goals.
+
+### Storage Support
+
+USB mass storage is the primary boot medium. Fast local storage devices are supported for application loading. Network boot is not included because it introduces network coordination overhead inconsistent with the design philosophy and the air-gapped deployment context.
+
+### Input and Output
+
+Basic serial console and VGA text mode output are provided for development and debugging. No advanced graphics initialization is performed during boot.
+
+---
+
+## Security Model
+
+### Trust Boundaries
+
+**Trusted:** Boot media from verified physical source, hardware platform, physical environment, single user with physical access.
+
+**Not Addressed:** Network attacks (system is air-gapped), multi-user isolation (single user), adversarial software (trusted user, verified media).
+
+### No Cryptographic Security Features
+
+QIBIOS provides no cryptographic security features. No signature verification, no encrypted storage, no secure boot in the traditional sense, no attestation chain. Security is achieved through physical access control, verified boot media sources, and isolation architecture.
+
+### Correct Application of This Design
+
+**QIBIOS is appropriate for:**
+- Air-gapped research and computation systems
+- Quantum-like computing development platforms
+- Single-user offline computation environments
+- Performance benchmarking systems
+- Experimental computing platforms
+
+**QIBIOS is not appropriate for:**
+- Networked systems
+- Multi-user systems
+- Systems processing sensitive data in adversarial environments
+- Systems without physical security
+
+---
+
+## Minimum Hardware Requirements
+
+QIBIOS is designed to be lightweight. It runs on modest hardware.
+
+**Minimum Requirements:**
+- Any 64-bit processor (x86_64, ARM64, or RISC-V RV64GC)
+- 64MB RAM
+- Any bootable storage medium (USB, SSD, hard drive)
+- Serial or VGA output for development and debugging
+
+**Recommended for QIOS Workloads:**
+- Modern 64-bit processor with hardware memory protection
+- 256MB or more RAM for meaningful parallel lane workloads
+- Fast storage for application loading
+- Serial console for low-overhead output
+
+---
+
+## Comparison: QIBIOS vs CIBIOS
+
+| Feature | CIBIOS | QIBIOS |
+|---|---|---|
+| Communication Mode | Cryptographic | Lightweight Handshake |
+| OS Verification | Cryptographic signature required | Lightweight handshake |
+| Boot Target | Multi-user, networked | Single-user, air-gapped |
+| Boot Time | Optimized with verification | Minimal, under one second target |
+| Security Model | Cryptographic verification chain | Physical security boundary |
+| Global Locks | None | None |
+| Isolation Establishment | Before kernel | Before kernel |
+| Event-Driven Init | Yes | Yes |
+| HIP Mode | Cryptographic | Lightweight Handshake |
+| Hardware Vendor Features | Optional, with warnings | Not needed |
+
+---
+
+## Implementation Language and Evolution Path
+
+### Current Implementation in Rust
+
+QIBIOS is implemented in Rust targeting binary processor architectures. Rust provides memory safety, zero-cost abstractions for performance-critical boot code, minimal runtime appropriate for firmware-level software, and strong support across x86_64, ARM64, and RISC-V.
+
+### Transition to Non-Binary Computation
+
+The isolation and event-driven initialization principles of QIBIOS do not require binary computation. When non-binary hardware becomes practical—whether through analog, event-analog, or other non-binary substrate designs—QIBIOS's architecture maps to that substrate:
+
+- Event-driven initialization maps to natural substrate event mechanisms
+- Isolation boundary establishment maps to substrate-specific protection mechanisms
+- The lightweight handshake to QIOS remains valid regardless of substrate
+
+Non-binary substrates may require programming languages designed for their execution model. Research into appropriate languages for non-binary firmware represents a future development area. QIBIOS's architectural principles provide the design foundation that any such language would implement.
+
+---
+
+## Implementation Roadmap
+
+### Phase 1: Core Boot Implementation (Months 1 to 4)
+
+Basic x86_64 boot implementation with event-driven initialization. Memory isolation boundary establishment before kernel. USB boot support. Serial debug output. QIOS handoff validation.
+
+### Phase 2: Architecture Expansion (Months 3 to 6)
+
+ARM64 support with appropriate power management initialization. RISC-V support. Fast storage boot support. Performance optimization across all architectures.
+
+### Phase 3: Quantum-Like Optimization (Months 5 to 8)
+
+High-precision timer initialization for application use. Memory configuration optimized for lane-based workloads. Parallel hardware initialization where semantically correct. Processor state preservation for maximum computational availability at handoff.
+
+### Phase 4: Ecosystem Integration (Months 7 to 12)
+
+QIOS kernel integration validation. Development and debugging tools. Documentation. Community support channels.
+
+---
+
+## Licensing and Availability
+
+**License:** Open source (MIT or Apache 2.0)
+
+**Source Availability:** Complete source code published
+
+**Documentation:** Full technical documentation included
+
+**Community:** Active development with community contributions welcome
