@@ -3,326 +3,212 @@
 
 ## Introduction
 
-This guide covers everything an administrator needs to deploy, configure, and operate CIBIOS and CIBOS systems. It assumes you have read the CIBIOS and CIBOS READMEs and understand the architectural principles. This guide explains how to apply those principles to real deployments.
+This guide covers everything an administrator needs to deploy, configure, and operate CIBIOS and CIBOS systems. It assumes familiarity with the CIBIOS and CIBOS READMEs and understanding of HIP architectural principles. This guide explains how to apply those principles to real deployments.
 
 ---
 
 ## Chapter 1: Deployment Planning
 
+### The Quantum-Like to Security Spectrum
+
+All profiles provide HIP's quantum-like computational properties (P, I, N, A). The profiles differ in which security features are added on top of that foundation. Every profile has high QTM scores because the foundation is always present. Security features add overhead; they do not reduce quantum-like properties.
+
+```
+PROFILE SPECTRUM:
+
+MAXIMUM QUANTUM-LIKE                        MAXIMUM SECURITY
+(Minimum Overhead)                          (Additional Overhead)
+
+◄────────────────────────────────────────────────────────────────────►
+
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│   COMPUTE    │  │  BALANCED    │  │ PERFORMANCE  │  │   MAXIMUM    │
+│              │  │              │  │              │  │  ISOLATION   │
+│ P = maximum  │  │ P = high     │  │ P = high     │  │ P = moderate │
+│ I = maximum  │  │ I = high     │  │ I = high     │  │ I = high     │
+│ N = maximum  │  │ N = high-mod │  │ N = moderate │  │ N = maximum  │
+│ A = maximum  │  │ A = high     │  │ A = high     │  │ A = high     │
+│              │  │              │  │              │  │              │
+│ Security:    │  │ Security:    │  │ Security:    │  │ Security:    │
+│  None needed │  │  Crypto IPC  │  │  None        │  │  Full stack  │
+│  (air-gapped)│  │  User auth   │  │  (physical)  │  │  RTRO        │
+│              │  │  RTRO (opt)  │  │              │  │  Multi-user  │
+│ SMT: Enabled │  │              │  │ SMT: Enabled │  │  Audit       │
+│ Overhead:    │  │ SMT: Disabled│  │ Overhead:    │  │              │
+│  ~10-20 cyc  │  │ (default)    │  │  ~30-50 cyc  │  │ SMT: Disabled│
+│  /selection  │  │ Overhead:    │  │  + fairness  │  │ Overhead:    │
+│              │  │  ~5-15%      │  │              │  │  ~10-20%     │
+└──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘
+
+ALL PROFILES HAVE HIGH QTM — FOUNDATION (P, I, N, A) PRESENT IN ALL
+SECURITY FEATURES ADD OVERHEAD, DON'T REDUCE PROPERTIES
+```
+
 ### Profile Selection Decision Tree
 
 ```
-PROFILE SELECTION:
+START: What is your threat model?
 
-┌─────────────────────────────────────────────────────────────┐
-│                  THREAT MODEL ASSESSMENT                     │
-│                                                             │
-│  START: What is your threat model?                          │
-│                                                             │
-│  ├─► Adversarial network observer?                          │
-│  │   └─► Multi-user system?                                 │
-│  │       └─► Maximum Isolation Profile                      │
-│                                                             │
-│  ├─► Network-connected but no sophisticated adversary?      │
-│  │   └─► Single user or small trusted group?                │
-│  │       └─► Balanced Profile                               │
-│                                                             │
-│  ├─► Limited hardware?                                      │
-│  │   └─► Responsiveness priority?                           │
-│  │       └─► Performance Profile                            │
-│                                                             │
-│  ├─► Air-gapped system?                                     │
-│  │   └─► Maximum computational throughput?                  │
-│  │       └─► Compute Profile                                │
-│                                                             │
-│  └─► Unsure?                                                │
-│      └─► Balanced Profile (safe default)                    │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+├── Adversarial network observer?
+│   └── Multi-user system?
+│       └── MAXIMUM ISOLATION Profile
+│
+├── Network-connected but no sophisticated adversary?
+│   └── Single user or small trusted group?
+│       └── BALANCED Profile
+│
+├── Limited hardware, responsiveness priority?
+│   └── PERFORMANCE Profile
+│
+├── Air-gapped system, maximum throughput?
+│   └── COMPUTE Profile
+│
+└── Unsure?
+    └── BALANCED Profile (safe default)
 ```
 
-### Profile Summary
+### Profile Summary Reference
 
-```
-PROFILE SUMMARY:
+**Maximum Isolation:**
+- RTRO: Always compiled | Weights: 1:1:1 (equal) | Anti-starvation: NOT compiled
+- Full-fairness: NOT compiled | SMT: Disabled | IPC: Cryptographic
+- Multi-user: Yes | Handoff: Cryptographic | Overhead: Higher (security features)
+- Use: Enterprise servers, high-security multi-user workstations
 
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  MAXIMUM ISOLATION:                                         │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Primary use: Adversarial multi-user environments     │   │
-│  │ RTRO: Yes (always)                                  │   │
-│  │ Weights: Equal (1:1:1)                              │   │
-│  │ Anti-starvation: Not compiled                        │   │
-│  │ Full fairness: Not compiled                          │   │
-│  │ SMT: Disabled                                        │   │
-│  │ Network: Yes                                         │   │
-│  │ Multi-user: Yes                                      │   │
-│  │ Handoff: Cryptographic                               │   │
-│  │ Optional features: None recommended                  │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  BALANCED:                                                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Primary use: General personal workstations           │   │
-│  │ RTRO: Optional (build flag)                          │   │
-│  │ Weights: 3:1:1 (default, configurable)               │   │
-│  │ Anti-starvation: Yes (100ms default)                 │   │
-│  │ Full fairness: Not compiled                          │   │
-│  │ SMT: Disabled by default (user may enable)           │   │
-│  │ Network: Yes                                         │   │
-│  │ Multi-user: Optional                                 │   │
-│  │ Handoff: Cryptographic                               │   │
-│  │ Optional features: rtro, signal-coalescence,         │   │
-│  │   signal-coalescence-threshold, class-resource-pools,│   │
-│  │   class-core-affinity                                │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  PERFORMANCE:                                               │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Primary use: Limited hardware, offline systems       │   │
-│  │ RTRO: Not compiled                                   │   │
-│  │ Weights: 5:2:1 (default, configurable)               │   │
-│  │ Anti-starvation: Yes (50ms default)                  │   │
-│  │ Full fairness: Yes                                   │   │
-│  │ SMT: Enabled                                         │   │
-│  │ Network: Optional                                    │   │
-│  │ Multi-user: No                                       │   │
-│  │ Handoff: Cryptographic                               │   │
-│  │ Optional features: signal-coalescence,               │   │
-│  │   signal-coalescence-threshold, class-resource-pools,│   │
-│  │   class-core-affinity                                │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  COMPUTE:                                                   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Primary use: Air-gapped computation                  │   │
-│  │ RTRO: Not compiled                                   │   │
-│  │ Weights: Equal or per-lane (application-controlled)  │   │
-│  │ Anti-starvation: Optional                            │   │
-│  │ Full fairness: Optional                              │   │
-│  │ SMT: Enabled                                         │   │
-│  │ Network: No                                          │   │
-│  │ Multi-user: No                                       │   │
-│  │ Handoff: Lightweight                                 │   │
-│  │ Optional features: anti-starvation, signal-coalescence│   │
-│  │   signal-coalescence-threshold, class-resource-pools,│   │
-│  │   class-core-affinity                                │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+**Balanced:**
+- RTRO: Optional | Weights: 3:1:1 (configurable) | Anti-starvation: 100ms
+- Full-fairness: NOT compiled | SMT: Disabled (default) | IPC: Cryptographic
+- Multi-user: Optional | Handoff: Cryptographic | Overhead: Low
+- Use: Developer laptops, personal workstations, home computing
+
+**Performance:**
+- RTRO: NOT compiled | Weights: 5:2:1 (configurable) | Anti-starvation: 50ms
+- Full-fairness: Compiled | SMT: Enabled | IPC: Optional
+- Multi-user: No | Handoff: Cryptographic | Overhead: Moderate (fairness mechanisms)
+- Use: Legacy hardware, embedded systems, resource-constrained devices
+
+**Compute:**
+- RTRO: NOT compiled | Weights: Equal or per-lane | Anti-starvation: Optional
+- Full-fairness: NOT compiled | SMT: Enabled | IPC: Lightweight handshake
+- Multi-user: No | Handoff: Lightweight | Overhead: Minimum
+- Use: Air-gapped research, maximum throughput computation
 
 ### Hardware Requirements
 
-```
-HARDWARE REQUIREMENTS BY PROFILE:
-
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  MAXIMUM ISOLATION:                                         │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Minimum: 2 cores, 4 GB RAM, 20 GB storage           │   │
-│  │ Recommended: 4+ cores, 8+ GB RAM, SSD               │   │
-│  │ Reason: Equal weights create contention             │   │
-│  │          Need hardware headroom for fairness         │   │
-│  │          SMT disabled reduces execution contexts     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  BALANCED:                                                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Minimum: 1 core, 2 GB RAM, 10 GB storage            │   │
-│  │ Recommended: 2+ cores, 4+ GB RAM, SSD               │   │
-│  │ Reason: Weighted scheduling reduces contention      │   │
-│  │          Anti-starvation ensures fairness           │   │
-│  │          SMT can be enabled if needed               │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  PERFORMANCE:                                               │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Minimum: 1 core, 1 GB RAM, 5 GB storage             │   │
-│  │ Recommended: 2+ cores, 2+ GB RAM, any storage       │   │
-│  │ Reason: Designed for limited hardware               │   │
-│  │          Full fairness guarantees progress          │   │
-│  │          SMT enabled maximizes throughput            │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  COMPUTE:                                                   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Minimum: 1 core, 128 MB RAM, any storage            │   │
-│  │ Recommended: 2+ cores, 1+ GB RAM, fast storage      │   │
-│  │ Reason: Minimal overhead for computation            │   │
-│  │          Scales with workload, not profile           │   │
-│  │          SMT enabled for max parallelism            │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  MOBILE (CIBOS-MOBILE):                                     │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Minimum: 2 cores, 1 GB RAM, 4 GB storage            │   │
-│  │ Recommended: 4+ cores, 2+ GB RAM, 8+ GB storage     │   │
-│  │ Reason: Sensor subsystem overhead                   │   │
-│  │          Touch subsystem requires responsiveness    │   │
-│  │          Power management for battery life          │   │
-│  │          Recommended profiles: Maximum Isolation,   │   │
-│  │          Balanced (not Compute)                      │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+| Profile | Minimum | Recommended | Note |
+|---|---|---|---|
+| Maximum Isolation | 2 cores, 4 GB RAM, 20 GB storage | 4+ cores, 8+ GB RAM, SSD | Equal weights create more contention — hardware headroom helps |
+| Balanced | 1 core, 2 GB RAM, 10 GB storage | 2+ cores, 4+ GB RAM, SSD | — |
+| Performance | 1 core, 1 GB RAM, 5 GB storage | 2+ cores, 2+ GB RAM | SMT enabled doubles effective contexts |
+| Compute | 1 core, 128 MB RAM | 2+ cores, 1+ GB RAM, fast storage | More cores = more simultaneous lane executions |
 
 ### Execution Context Planning
 
 ```
-EXECUTION CONTEXT PLANNING:
+WHEN WEIGHTS MATTER — VISUAL:
 
-┌─────────────────────────────────────────────────────────────┐
-│              UNDERSTANDING EXECUTION CONTEXTS                │
-│                                                             │
-│  EXECUTION CONTEXTS = PHYSICAL CORES × SMT FACTOR           │
-│                                                             │
-│  Examples:                                                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ 4 cores, no SMT:     4 execution contexts          │   │
-│  │ 4 cores, 2-way SMT:   8 execution contexts          │   │
-│  │ 8 cores, 2-way SMT:   16 execution contexts         │   │
-│  │ 8 cores, 4-way SMT:   32 execution contexts         │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  WHY THIS MATTERS:                                          │
-│                                                             │
-│  When Ready Pool has N events and C execution contexts:     │
-│                                                             │
-│  - If N ≤ C: ALL N events dispatch simultaneously          │
-│    No weighted entropy needed                              │
-│    Maximum throughput                                       │
-│                                                             │
-│  - If N > C: Weighted entropy selects C events             │
-│    Remaining N-C events stay in Ready Pool                  │
-│    Selection determined by weights                         │
-│                                                             │
-│  IMPLICATION:                                               │
-│  More execution contexts = less competition =               │
-│  less weight influence = more simultaneous execution        │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  WHEN WEIGHTS DON'T MATTER:                                                 │
+│                                                                             │
+│  Ready Pool: 4 events       Available contexts: 8                          │
+│                                                                             │
+│  4 ≤ 8 → ALL 4 DISPATCH SIMULTANEOUSLY                                     │
+│  Weight values: IRRELEVANT                                                  │
+│  Selection: NONE NEEDED                                                     │
+│                                                                             │
+│  ┌───┐  ┌───┐  ┌───┐  ┌───┐                                                │
+│  │ A │  │ B │  │ C │  │ D │   ─────►   All dispatch simultaneously         │
+│  │w=1│  │w=1│  │w=1│  │w=1│                                                │
+│  └───┘  └───┘  └───┘  └───┘                                                │
+│                                                                             │
+│  ─────────────────────────────────────────────────────────────────────     │
+│                                                                             │
+│  WHEN WEIGHTS MATTER:                                                       │
+│                                                                             │
+│  Ready Pool: 10 events      Available contexts: 4                          │
+│                                                                             │
+│  10 > 4 → COMPETITION EXISTS — weighted entropy selects 4                  │
+│  Weight values: DETERMINE PROBABILITY                                       │
+│                                                                             │
+│  System (weight 3):  3 tickets each                                        │
+│  User (weight 1):    1 ticket each                                         │
+│  Bg (weight 1):      1 ticket each                                         │
+│                                                                             │
+│  Example: 2 system, 5 user, 3 bg = 6+5+3=14 tickets                       │
+│  Each system event: 3/14 = 21.4% probability                               │
+│  Each user event:   1/14 =  7.1% probability                               │
+│  Each bg event:     1/14 =  7.1% probability                               │
+│                                                                             │
+│  KEY INSIGHT:                                                               │
+│  On well-provisioned systems (many contexts, low load),                     │
+│  weight tuning has minimal effect.                                          │
+│  Weight tuning matters most on limited hardware under heavy load.           │
+│  Maximum Isolation ALWAYS requires equal weights (security).                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+Execution contexts = Physical Cores × SMT Factor. More contexts → less competition → less weight influence → more simultaneous execution.
 
 ---
 
 ## Chapter 2: Building and Installation
 
-### Build Prerequisites
-
-```
-BUILD PREREQUISITES:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    REQUIREMENTS                              │
-│                                                             │
-│  SOFTWARE:                                                  │
-│  - Rust toolchain (stable with nightly features)            │
-│  - Cross-compilation targets for target architectures      │
-│  - Linker scripts for target hardware                      │
-│  - Signing tool for configuration files                    │
-│                                                             │
-│  HARDWARE:                                                  │
-│  - Target hardware or emulator (QEMU supported)            │
-│  - Boot media (USB, SD card, or direct flash)              │
-│                                                             │
-│  KEYS:                                                      │
-│  - Ed25519 key pair for config signing                     │
-│  - Public key embedded at build time                       │
-│  - Private key for signing configs                         │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
 ### Build Commands
 
-```
-BUILD COMMANDS:
+```bash
+# Maximum Isolation
+cargo build --profile maximum-isolation
 
-┌─────────────────────────────────────────────────────────────┐
-│                    BUILD PROCESS                             │
-│                                                             │
-│  BUILD SPECIFIC PROFILE:                                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # Maximum Isolation                                  │   │
-│  │ cargo build --profile maximum-isolation             │   │
-│  │                                                      │   │
-│  │ # Balanced                                           │   │
-│  │ cargo build --profile balanced                      │   │
-│  │                                                      │   │
-│  │ # Performance                                        │   │
-│  │ cargo build --profile performance                   │   │
-│  │                                                      │   │
-│  │ # Compute                                            │   │
-│  │ cargo build --profile compute                       │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  BUILD FOR SPECIFIC ARCHITECTURE:                          │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # x86_64                                             │   │
-│  │ cargo build --target x86_64-unknown-none            │   │
-│  │                                                      │   │
-│  │ # ARM64                                              │   │
-│  │ cargo build --target aarch64-unknown-none           │   │
-│  │                                                      │   │
-│  │ # RISC-V                                             │   │
-│  │ cargo build --target riscv64-unknown-none           │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  CUSTOM FEATURE COMBINATION:                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ cargo build --no-default-features \                 │   │
-│  │   --features "anti-starvation,network-stack,gui"    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  VERIFY BUILD:                                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ cargo run --package builder -- \                     │   │
-│  │   --verify-features --binary target/firmware.bin     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+# Balanced
+cargo build --profile balanced
+
+# Performance
+cargo build --profile performance
+
+# Compute
+cargo build --profile compute
+
+# Custom feature combination
+cargo build --no-default-features \
+  --features "anti-starvation,signal-coalescence,cryptographic-ipc,gui-subsystem"
+
+# Architecture-specific
+cargo build --target x86_64-unknown-none
+cargo build --target aarch64-unknown-none
+cargo build --target riscv64-unknown-none
+
+# Verify feature combination before building
+cargo run --package builder -- --verify-features \
+  --features "anti-starvation,signal-coalescence-threshold"
 ```
 
-### Installation Media Creation
+### Build Verification Output Examples
 
 ```
-INSTALLATION MEDIA:
+# Valid combination:
+#   ✓ anti-starvation: valid
+#   ✓ signal-coalescence-threshold: valid
+#   ✓ Shared infrastructure available: YES (timing shared)
+#   VALID: Feature combination is legal
 
-┌─────────────────────────────────────────────────────────────┐
-│                  INSTALLATION PROCESS                        │
-│                                                             │
-│  CREATE BOOT MEDIA:                                        │
-│  1. Format USB as FAT32                                    │
-│  2. Copy CIBIOS firmware image                             │
-│  3. Copy CIBOS kernel                                      │
-│  4. Copy configuration (if needed)                         │
-│  5. Copy signature (Standard profile)                      │
-│                                                             │
-│  DIRECTORY STRUCTURE:                                       │
-│  /boot/                                                     │
-│    ├── cibios.bin                                          │
-│    ├── cibos-kernel                                        │
-│    ├── cibos.conf                                          │
-│    └── cibos.sig                                           │
-│                                                             │
-│  FLASH TO DEVICE:                                           │
-│  - Use device-specific flashing tool                       │
-│  - Or boot from USB for testing                            │
-│                                                             │
-│  VERIFY INSTALLATION:                                       │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # Verify files present                               │   │
-│  │ ls -la /boot/                                        │   │
-│  │                                                      │   │
-│  │ # Verify signature (if applicable)                   │   │
-│  │ cibos-verify --config cibos.conf --sig cibos.sig    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+# Invalid combination:
+#   cargo run --package builder -- --verify-features \
+#     --features "rtro,lightweight-handshake"
+#   ✓ rtro: valid
+#   ✗ lightweight-handshake: PROHIBITS rtro
+#   INVALID: Feature conflict detected
+```
+
+### Installation Media
+
+```
+/boot/
+  ├── cibios.bin
+  ├── cibos-kernel
+  ├── cibos.conf
+  └── cibos.sig       (Standard profile only)
 ```
 
 ---
@@ -331,1553 +217,34 @@ INSTALLATION MEDIA:
 
 ### Configuration File
 
-```
-CONFIGURATION FILE:
-
-┌─────────────────────────────────────────────────────────────┐
-│                 /boot/cibos.conf                             │
-│                                                             │
-│  [scheduling]                                               │
-│  # Weights control selection probability                    │
-│  # Only apply when competition exists                       │
-│  # (more ready events than execution contexts)              │
-│  system_weight = 3        # System components               │
-│  user_weight = 1          # User applications               │
-│  background_weight = 1    # Background tasks                │
-│                                                             │
-│  # Anti-starvation threshold (milliseconds)                 │
-│  # Only effective if compiled in                           │
-│  # Balanced and Performance profiles only                   │
-│  anti_starvation_threshold_ms = 100                         │
-│                                                             │
-│  [resources]                                                │
-│  # Per-container memory limit (MB)                          │
-│  memory_limit_mb = 512                                      │
-│                                                             │
-│  # I/O bandwidth limit (MB/s)                               │
-│  io_bandwidth_mbps = 100                                    │
-│                                                             │
-│  [channels]                                                 │
-│  max_channels_per_container = 16                            │
-│  message_queue_size = 256                                   │
-│                                                             │
-│  [signal-coalescence]                                       │
-│  # Enable signal coalescence (if compiled in)               │
-│  enabled = true                                             │
-│                                                             │
-│  # Backstop threshold (milliseconds)                        │
-│  # Process buffered signals after this duration             │
-│  backstop_threshold_ms = 5                                  │
-│                                                             │
-│  [resource-pools]                                           │
-│  # Per-class memory pools (if compiled in)                  │
-│  # Percentages must sum to 100                              │
-│  system_pool_pct = 40                                       │
-│  user_pool_pct = 50                                         │
-│  background_pool_pct = 10                                   │
-│                                                             │
-│  [core-affinity]                                            │
-│  # Execution context assignment by class (if compiled in)   │
-│  # Values must sum to total execution contexts              │
-│  system_contexts = 8                                        │
-│  user_contexts = 7                                          │
-│  background_contexts = 1                                     │
-│                                                             │
-│  [signature]                                                │
-│  algorithm = "ed25519"                                      │
-│  signature = "<base64>"                                     │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Understanding Weight Application
-
-```
-WHEN WEIGHTS MATTER:
-
-┌─────────────────────────────────────────────────────────────┐
-│              WEIGHT APPLICATION RULES                        │
-│                                                             │
-│  WEIGHTS ONLY APPLY WHEN COMPETITION EXISTS                │
-│                                                             │
-│  Competition = More ready events than execution contexts    │
-│                                                             │
-│  EXAMPLE 1: No Competition                                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Ready Pool: 3 events                                │   │
-│  │ Available execution contexts: 8                     │   │
-│  │                                                     │   │
-│  │ Result: All 3 events dispatch simultaneously       │   │
-│  │ Weight values: IRRELEVANT                           │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  EXAMPLE 2: Competition Exists                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Ready Pool: 10 events                               │   │
-│  │ Available execution contexts: 4                     │   │
-│  │                                                     │   │
-│  │ Result: Weighted entropy selects 4 events           │   │
-│  │ Weight values: DETERMINE SELECTION                  │   │
-│  │ Remaining 6 stay in Ready Pool                      │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  IMPLICATION:                                               │
-│  On systems with many cores and low load,                   │
-│  weight configuration has minimal effect.                   │
-│  Weight tuning is most important on:                        │
-│  - Limited hardware (few execution contexts)                │
-│  - High load (many ready events)                           │
-│  - Maximum Isolation (equal weights required)               │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Signing Configuration
-
-```
-SIGNING CONFIGURATION:
-
-┌─────────────────────────────────────────────────────────────┐
-│                  SIGNING PROCESS                             │
-│                                                             │
-│  GENERATE KEYS:                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ cibos-keygen --output /path/to/keys                 │   │
-│  │                                                      │   │
-│  │ Creates:                                             │   │
-│  │   /path/to/keys/signing.key (private)               │   │
-│  │   /path/to/keys/verifying.key (public)              │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  SIGN CONFIGURATION:                                        │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ cibos-sign \                                         │   │
-│  │   --config /boot/cibos.conf \                       │   │
-│  │   --key /path/to/keys/signing.key \                 │   │
-│  │   --output /boot/cibos.sig                          │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  VERIFY SIGNATURE:                                          │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ cibos-verify \                                       │   │
-│  │   --config /boot/cibos.conf \                       │   │
-│  │   --sig /boot/cibos.sig \                           │   │
-│  │   --key /path/to/keys/verifying.key                 │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  KEY MANAGEMENT:                                            │
-│  - Public key embedded in CIBIOS at build time             │
-│  - Private key never stored on deployed system             │
-│  - Rotate keys periodically                                │
-│  - Rebuild CIBIOS to embed new public key                  │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### What Happens Without Valid Configuration
-
-```
-CONFIGURATION FALLBACK:
-
-┌─────────────────────────────────────────────────────────────┐
-│                  FALLBACK BEHAVIOR                           │
-│                                                             │
-│  IF CONFIG FILE MISSING:                                    │
-│  └─► System uses compiled defaults                         │
-│      └─► Boot proceeds normally                            │
-│                                                             │
-│  IF CONFIG SIGNATURE INVALID:                               │
-│  └─► System uses compiled defaults                         │
-│      └─► Warning logged                                    │
-│      └─► Boot proceeds normally                            │
-│                                                             │
-│  COMPILED DEFAULTS BY PROFILE:                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Maximum Isolation:                                  │   │
-│  │   system_weight = 1                                 │   │
-│  │   user_weight = 1                                   │   │
-│  │   background_weight = 1                             │   │
-│  │                                                     │   │
-│  │ Balanced:                                            │   │
-│  │   system_weight = 3                                 │   │
-│  │   user_weight = 1                                   │   │
-│  │   background_weight = 1                             │   │
-│  │   anti_starvation_threshold_ms = 100                │   │
-│  │                                                     │   │
-│  │ Performance:                                         │   │
-│  │   system_weight = 5                                 │   │
-│  │   user_weight = 2                                   │   │
-│  │   background_weight = 1                             │   │
-│  │   anti_starvation_threshold_ms = 50                 │   │
-│  │                                                     │   │
-│  │ Compute:                                             │   │
-│  │   system_weight = 1                                 │   │
-│  │   user_weight = 1                                   │   │
-│  │   background_weight = 1                             │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  IMPORTANT: Absent or invalid config is NOT an error         │
-│            System remains operational                        │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Chapter 4: SMT Configuration
-
-### Understanding SMT in CIBOS
-
-```
-SMT OVERVIEW:
-
-┌─────────────────────────────────────────────────────────────┐
-│                 SMT IN CIBOS                                 │
-│                                                             │
-│  SMT (Simultaneous Multithreading) is configured by CIBIOS   │
-│  at boot before CIBOS receives control.                     │
-│                                                             │
-│  CIBOS inherits the SMT state from CIBIOS.                  │
-│                                                             │
-│  EXECUTION CONTEXTS:                                        │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │                                                     │   │
-│  │  Without SMT:                                       │   │
-│  │  Physical Cores = Execution Contexts                │   │
-│  │  4 cores = 4 simultaneous events                    │   │
-│  │                                                     │   │
-│  │  With 2-way SMT:                                    │   │
-│  │  Execution Contexts = Physical Cores × 2            │   │
-│  │  4 cores = 8 simultaneous events                    │   │
-│  │                                                     │   │
-│  │  With 4-way SMT:                                    │   │
-│  │  Execution Contexts = Physical Cores × 4            │   │
-│  │  4 cores = 16 simultaneous events                   │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### SMT by Profile
-
-```
-SMT CONFIGURATION BY PROFILE:
-
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  MAXIMUM ISOLATION:                                         │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ SMT: DISABLED                                        │   │
-│  │ Reason: Eliminate hardware side channels            │   │
-│  │ Trade-off: Fewer execution contexts                 │   │
-│  │           Acceptable for security priority           │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  BALANCED:                                                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ SMT: DISABLED by default (user may enable)           │   │
-│  │ Reason: Security-conscious default                  │   │
-│  │ Note: User can enable if threat model permits       │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  PERFORMANCE:                                               │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ SMT: ENABLED                                         │   │
-│  │ Reason: Maximize throughput on limited hardware     │   │
-│  │ Trade-off: Hardware side channels present           │   │
-│  │           Acceptable for non-adversarial use         │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  COMPUTE:                                                   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ SMT: ENABLED                                         │   │
-│  │ Reason: Maximum parallel computation                │   │
-│  │ Trade-off: Hardware side channels present           │   │
-│  │           Acceptable for air-gapped environment      │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  MOBILE (CIBOS-MOBILE):                                     │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ SMT: DISABLED by default (user may enable)           │   │
-│  │ Reason: Security-conscious default for mobile       │   │
-│  │ Note: Can enable for performance on capable hardware │   │
-│  │ Battery impact: SMT may increase power consumption   │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Why SMT Doesn't Create Traditional Bottlenecks
-
-```
-SMT IN CIBOS vs TRADITIONAL SYSTEMS:
-
-┌─────────────────────────────────────────────────────────────┐
-│           WHY SMT IS DIFFERENT IN CIBOS                      │
-│                                                             │
-│  TRADITIONAL SYSTEMS WITH SMT:                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Problems:                                            │   │
-│  │ - Thread contention for locks                        │   │
-│  │ - Cache thrashing from shared state                  │   │
-│  │ - Time-slice serialization                           │   │
-│  │ - Observable contention patterns                     │   │
-│  │                                                     │   │
-│  │ Result: SMT often degrades performance              │   │
-│  │         under high load                             │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  CIBOS WITH SMT:                                            │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ No locks: No thread contention                      │   │
-│  │ Isolated memory: No cache thrashing (intentional)   │   │
-│  │ Event-driven: No time-slicing                       │   │
-│  │ No shared state: No contention patterns            │   │
-│  │                                                     │   │
-│  │ Result: SMT provides additional execution          │   │
-│  │         contexts without software overhead          │   │
-│  │                                                     │   │
-│  │ Only hardware-level sharing remains:               │   │
-│  │ - L1/L2 cache sharing between logical cores         │   │
-│  │ - Execution unit sharing                            │   │
-│  │ - This is the ONLY overhead                        │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  CONCLUSION:                                                │
-│  SMT in CIBOS adds capacity without adding contention.      │
-│  The hardware-level side channels are the only              │
-│  security consideration.                                   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Changing SMT Configuration
-
-SMT is determined at build time by profile selection. To change:
-1. Select a different profile, or
-2. Build with custom feature flag override
-3. Rebuild CIBIOS and CIBOS
-4. Flash new CIBIOS firmware
-5. System boots with new SMT configuration
-
----
-
-## Chapter 5: Weight Tuning
-
-### Understanding Weight Impact
-
-```
-WEIGHT IMPACT:
-
-┌─────────────────────────────────────────────────────────────┐
-│                  WEIGHT SELECTION PROBABILITY                │
-│                                                             │
-│  REMEMBER: Weights only apply when competition exists       │
-│                                                             │
-│  EXAMPLE: system_weight=3, user_weight=1, bg_weight=1       │
-│                                                             │
-│  Ready Pool has 10 events, 4 execution contexts:            │
-│    2 system events (weight 3 each = 6 tickets)              │
-│    5 user events (weight 1 each = 5 tickets)                │
-│    3 background events (weight 1 each = 3 tickets)          │
-│                                                             │
-│  Total: 14 tickets                                          │
-│                                                             │
-│  Selection probabilities (per event):                       │
-│    Each system event: 3/14 ≈ 21%                           │
-│    Each user event: 1/14 ≈ 7%                              │
-│    Each background event: 1/14 ≈ 7%                         │
-│                                                             │
-│  Collective probabilities:                                  │
-│    System events: 6/14 ≈ 43%                               │
-│    User events: 5/14 ≈ 36%                                 │
-│    Background events: 3/14 ≈ 21%                            │
-│                                                             │
-│  BUT if only 3 events ready and 8 contexts:                 │
-│    All 3 dispatch simultaneously                           │
-│    Weights irrelevant                                      │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Tuning Guidelines
-
-```
-TUNING GUIDELINES:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    TUNING GUIDE                              │
-│                                                             │
-│  UI LAGGING UNDER LOAD:                                     │
-│  Problem: Window manager, input handler slow                │
-│  Solution: Increase system_weight                           │
-│  Example: system_weight = 5                                 │
-│  Note: Only helps when competition exists                   │
-│                                                             │
-│  BACKGROUND TASKS NEVER COMPLETE:                           │
-│  Problem: Low-weight events starved                         │
-│  Solution: Enable anti-starvation or increase weight        │
-│  Example: background_weight = 2                             │
-│  Alternative: Reduce anti_starvation_threshold_ms           │
-│                                                             │
-│  UNPREDICTABLE PERFORMANCE:                                 │
-│  Problem: Too much entropy in selection                     │
-│  Solution: Use more differentiated weights                  │
-│  Example: system=5, user=2, background=1                    │
-│                                                             │
-│  TOO PREDICTABLE (for Maximum Isolation):                  │
-│  Problem: Weights not equal                                 │
-│  Solution: All weights = 1                                  │
-│  Example: system=1, user=1, background=1                    │
-│  Note: REQUIRED for Maximum Isolation                       │
-│                                                             │
-│  ANTI-STARVATION FIRING TOO OFTEN:                          │
-│  Problem: Threshold too low                                 │
-│  Solution: Increase threshold                               │
-│  Example: anti_starvation_threshold_ms = 200                │
-│                                                             │
-│  ANTI-STARVATION NEVER FIRES:                               │
-│  Problem: Threshold too high                                │
-│  Solution: Lower threshold                                  │
-│  Example: anti_starvation_threshold_ms = 50                 │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Weight Tuning by Profile
-
-```
-PROFILE-SPECIFIC TUNING:
-
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  MAXIMUM ISOLATION:                                         │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ DO NOT TUNE WEIGHTS                                  │   │
-│  │                                                     │   │
-│  │ All weights must remain equal (1:1:1)               │   │
-│  │ Unequal weights create observable patterns          │   │
-│  │ This is a SECURITY REQUIREMENT                      │   │
-│  │                                                     │   │
-│  │ Exception: Only change if you have analyzed         │   │
-│  │ the security implications                           │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  BALANCED:                                                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Default 3:1:1 is good for most workloads           │   │
-│  │                                                     │   │
-│  │ If UI feels sluggish:                               │   │
-│  │   Increase system_weight to 4 or 5                  │   │
-│  │                                                     │   │
-│  │ If background tasks stall:                          │   │
-│  │   Check anti_starvation_threshold                   │   │
-│  │   Or increase background_weight to 2               │   │
-│  │                                                     │   │
-│  │ For compute-heavy workloads:                        │   │
-│  │   Reduce system_weight to 2                         │   │
-│  │   Accept slightly slower UI                         │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  PERFORMANCE:                                               │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Default 5:2:1 for limited hardware                  │   │
-│  │                                                     │   │
-│  │ Very limited (2 cores, 2GB):                        │   │
-│  │   system_weight = 7, user = 3, bg = 1              │   │
-│  │                                                     │   │
-│  │ Moderate hardware (4 cores, 4GB):                   │   │
-│  │   system_weight = 4, user = 2, bg = 1              │   │
-│  │                                                     │   │
-│  │ Full fairness ensures all lanes get time            │   │
-│  │ Adjust weights for responsiveness preference        │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  COMPUTE:                                                   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ For fire-and-wait: equal weights (1:1:1)            │   │
-│  │ Maximize entropy, minimize predictability           │   │
-│  │                                                     │   │
-│  │ For interactive monitoring:                         │   │
-│  │   system_weight = 2 (CLI responsive)               │   │
-│  │   user_weight = 1 (compute lanes)                  │   │
-│  │                                                     │   │
-│  │ Per-lane weights available for applications         │   │
-│  │ Tune within application, not system config          │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Tuning Process
-
-1. Start with profile defaults
-2. Run representative workloads
-3. Observe which components feel slow or unresponsive
-4. Adjust weights incrementally (change by 1 at a time)
-5. Re-run workloads and observe change
-6. Sign new configuration file and deploy
-7. Monitor for unintended effects
-
-### Signal Coalescence Configuration
-
-Signal coalescence is an optional feature that improves throughput by processing multiple resource signals together:
-
-**Configuration:**
-
 ```toml
-[signal-coalescence]
-# Enable signal coalescence (if compiled in)
-enabled = true
-
-# Optional: backstop threshold in milliseconds
-# If signals buffered longer than threshold, process immediately
-backstop_threshold_ms = 5
-```
-
-**Trade-offs:**
-
-| Metric | Without Coalescence | With Coalescence |
-|--------|---------------------|------------------|
-| Throughput | Baseline | +30-50% |
-| Average latency | Lower | Slightly higher |
-| Signal processing overhead | ~400 cycles/signal | ~125 cycles/signal |
-| Complexity | Simpler | Moderate |
-
-**Interaction with anti-starvation:**
-
-If both `signal-coalescence-threshold` and `anti-starvation` are compiled in, they share timing infrastructure. No additional configuration needed - the sharing is automatic.
-
-**Benchmarking:**
-
-1. Run baseline test without coalescence
-2. Enable coalescence, run same test
-3. Compare throughput and latency
-4. Adjust threshold if needed
-
-```bash
-# Test without coalescence
-cibos-test --throughput --duration 60s
-
-# Test with coalescence
-cibos-test --throughput --duration 60s --signal-coalescence
-
-# Compare results
-```
-
-### Class Resource Pools Configuration
-
-When `class-resource-pools` is compiled in, you can configure per-class memory isolation:
-
-**Configuration:**
-
-```toml
-[resource-pools]
-# Percentage of total RAM per class
-# Must sum to 100
-system_pool_pct = 40
-user_pool_pct = 50
-background_pool_pct = 10
-```
-
-**What this does:**
-
-- System class containers allocate from system_pool only
-- User class containers allocate from user_pool only
-- Background class containers allocate from background_pool only
-- No cross-pool borrowing
-
-**When to use:**
-
-- System running critical services that must not be starved
-- Multi-user systems with user isolation requirements
-- Workloads where class isolation is more important than utilization
-
-**Trade-offs:**
-
-| Aspect | With Class Pools | Without Class Pools |
-|--------|------------------|---------------------|
-| Isolation | Strong per-class | Global sharing |
-| Utilization | May underutilize | Maximum utilization |
-| Starvation | Impossible across classes | Possible across classes |
-| Configuration | More complex | Simpler |
-
-### Core Assignation by Class Configuration
-
-When `class-core-affinity` is compiled in, you can assign execution contexts to weight classes:
-
-**Configuration:**
-
-```toml
-[core-affinity]
-# Number of execution contexts per class
-# Must sum to total execution contexts (physical cores × SMT factor)
-
-# Example for 8-core system with 2-way SMT = 16 contexts
-system_contexts = 8      # Half for system class
-user_contexts = 7        # Most of remainder for user class
-background_contexts = 1   # Minimal for background
-```
-
-**What this does:**
-
-- System events dispatch only to system_contexts
-- User events dispatch only to user_contexts
-- Background events dispatch only to background_contexts
-
-**No added complexity:**
-- Same selector logic
-- Same single pool
-- Only adds class as routing consideration
-- Existing cache affinity works within each class pool
-
-**When to use:**
-
-- Guaranteeing responsiveness for system services
-- Isolating user workloads from system overhead
-- Ensuring background tasks don't impact foreground
-
-**Monitoring:**
-
-```bash
-cibos-ctl core-affinity --stats
-
-Output:
-  System contexts: 0-7 (8 contexts)
-    Utilization: 45%
-    Avg dispatch latency: 12ms
-  User contexts: 8-14 (7 contexts)
-    Utilization: 78%
-    Avg dispatch latency: 34ms
-  Background contexts: 15 (1 context)
-    Utilization: 92%
-    Avg dispatch latency: 156ms
-```
-
----
-
-## Chapter 6: Resource Management
-
-### Memory Limits
-
-```
-MEMORY MANAGEMENT:
-
-┌─────────────────────────────────────────────────────────────┐
-│                   MEMORY LIMITS                              │
-│                                                             │
-│  SETTING LIMITS:                                            │
-│  memory_limit_mb = 512                                       │
-│                                                             │
-│  WHAT THIS MEANS:                                           │
-│  - Container can allocate up to 512 MB                      │
-│  - Allocation above limit causes stall                      │
-│  - Stall resolves when memory freed within container        │
-│  - NOT an OOM crash - container waits invisibly             │
-│                                                             │
-│  CHOOSING VALUES:                                           │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Browser containers: 512-2048 MB                      │   │
-│  │ Office applications: 128-512 MB                      │   │
-│  │ System services: 64-256 MB                           │   │
-│  │ Compute containers: Match workload dataset size      │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  MONITORING:                                                │
-│  cibos-ctl memory --container <id>                          │
-│  Shows:                                                     │
-│    - Current usage                                          │
-│    - Limit                                                  │
-│    - Stalled allocations                                    │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Channel Limits
-
-```
-CHANNEL MANAGEMENT:
-
-┌─────────────────────────────────────────────────────────────┐
-│                   CHANNEL LIMITS                             │
-│                                                             │
-│  SETTING LIMITS:                                            │
-│  max_channels_per_container = 16                            │
-│  message_queue_size = 256                                   │
-│                                                             │
-│  WHAT THIS MEANS:                                           │
-│  - Container can have up to 16 channels                     │
-│  - Each channel holds up to 256 pending messages            │
-│  - Sending to full channel causes stall                     │
-│  - Receiving from empty channel causes stall                │
-│                                                             │
-│  CHOOSING VALUES:                                           │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Most applications: 8-16 channels                     │   │
-│  │ Complex pipelines: 32-64 channels                    │   │
-│  │ Message queue: 64-256 depending on throughput       │   │
-│  │ High-throughput: 512+                               │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  MONITORING:                                                │
-│  cibos-ctl channels --container <id>                        │
-│  Shows:                                                     │
-│    - Active channels                                        │
-│    - Pending messages                                       │
-│    - Stalled senders/receivers                              │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Understanding Stalls
-
-```
-UNDERSTANDING STALLS:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    STALL BEHAVIOR                            │
-│                                                             │
-│  WHAT STALLS ARE:                                           │
-│  - Container cannot proceed until resource available        │
-│  - NOT an error condition                                  │
-│  - No retry loops, no polling                              │
-│  - Kernel tracks dependency                                 │
-│  - Container resumes when resource available                │
-│                                                             │
-│  COMMON STALL CAUSES:                                       │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Memory:                                              │   │
-│  │   Container limit exceeded                          │   │
-│  │   Solution: Free memory or increase limit           │   │
-│  │                                                     │   │
-│  │ Channel buffer:                                      │   │
-│  │   Send to full buffer                               │   │
-│  │   Solution: Receiver reads from buffer               │   │
-│  │                                                     │   │
-│  │ Channel data:                                        │   │
-│  │   Receive from empty buffer                          │   │
-│  │   Solution: Sender writes to buffer                  │   │
-│  │                                                     │   │
-│  │ I/O:                                                 │   │
-│  │   Disk or network operation pending                 │   │
-│  │   Solution: Wait for completion                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  MULTI-RESOURCE STALLS:                                     │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Container may need multiple resources               │   │
-│  │ All must be available before moving to Ready Pool   │   │
-│  │ Example: Needs memory AND channel buffer            │   │
-│  │   Memory freed but buffer still full               │   │
-│  │   Container stays in Stalled List                   │   │
-│  │   Moved to Ready Pool only when BOTH available     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Chapter 7: Monitoring and Diagnostics
-
-### System Status
-
-```
-MONITORING COMMANDS:
-
-┌─────────────────────────────────────────────────────────────┐
-│                  MONITORING                                  │
-│                                                             │
-│  SCHEDULER STATUS:                                          │
-│  cibos-ctl scheduler                                        │
-│  Output:                                                    │
-│    Ready Pool: 15 events                                    │
-│    Stalled List: 3 containers                               │
-│    Cores: 4 (2 busy, 2 available)                          │
-│    Entropy source: hardware RNG                             │
-│    SMT: Disabled                                            │
-│    Execution Contexts: 4                                    │
-│                                                             │
-│  DISPATCH STATISTICS:                                       │
-│  cibos-ctl scheduler --stats                                │
-│  Output:                                                    │
-│    Dispatch Opportunities: 1,245,832                        │
-│    No-competition dispatches: 1,112,456 (89.3%)            │
-│    Competition dispatches: 133,376 (10.7%)                  │
-│    Average events per dispatch: 3.8                         │
-│    Max simultaneous dispatches: 8                           │
-│                                                             │
-│  MEMORY STATUS:                                             │
-│  cibos-ctl memory                                           │
-│  Output:                                                    │
-│    Total: 8192 MB                                           │
-│    Used: 4521 MB                                            │
-│    Available: 3671 MB                                       │
-│    Top consumers:                                           │
-│      container-a: 1024 MB                                   │
-│      container-b: 512 MB                                    │
-│                                                             │
-│  CONTAINER STATUS:                                          │
-│  cibos-ctl containers                                       │
-│  Output:                                                    │
-│    container-a: RUNNING (2 lanes active)                    │
-│    container-b: STALLED (waiting: memory)                   │
-│    container-c: INACTIVE                                    │
-│                                                             │
-│  CHANNEL STATUS:                                            │
-│  cibos-ctl channels                                         │
-│  Output:                                                    │
-│    Total channels: 24                                        │
-│    Pending messages: 156                                    │
-│    Stalled senders: 2                                       │
-│    Stalled receivers: 1                                      │
-│                                                             │
-│  EXECUTION CONTEXTS:                                        │
-│  cibos-ctl cores                                            │
-│  Output:                                                    │
-│    Physical Cores: 4                                         │
-│    SMT Factor: 2x (enabled)                                 │
-│    Logical Cores: 8                                          │
-│    Busy: 6                                                  │
-│    Available: 2                                              │
-│    Last-container affinity hits: 78%                         │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Dispatch Efficiency Monitoring
-
-```
-DISPATCH EFFICIENCY:
-
-┌─────────────────────────────────────────────────────────────┐
-│              DISPATCH EFFICIENCY                              │
-│                                                             │
-│  CIBOS dispatches multiple events simultaneously            │
-│  when no competition exists.                                │
-│                                                             │
-│  INTERPRETING STATS:                                        │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │                                                     │   │
-│  │ High no-competition % (> 80%):                      │   │
-│  │   System has sufficient resources                   │   │
-│  │   Weights have minimal effect                      │   │
-│  │   System handling load well                         │   │
-│  │                                                     │   │
-│  │ High competition % (> 30%):                         │   │
-│  │   System under heavy load                           │   │
-│  │   Weights significantly influence selection        │   │
-│  │   Consider more execution contexts                  │   │
-│  │   Or reduce number of ready events                  │   │
-│  │                                                     │   │
-│  │ Low events per dispatch:                            │   │
-│  │   Most dispatches are 1-2 events                   │   │
-│  │   Either many small events or high competition     │   │
-│  │                                                     │   │
-│  │ Max simultaneous = execution context count:         │   │
-│  │   This is expected                                 │   │
-│  │   System using all available contexts              │   │
-│  │                                                     │   │
-│  │ Max simultaneous < execution context count:         │   │
-│  │   Either light load                                │   │
-│  │   Or resource constraints limiting dispatch         │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Diagnosing Problems
-
-```
-DIAGNOSTICS:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    DIAGNOSTICS                               │
-│                                                             │
-│  UNRESPONSIVE SYSTEM:                                       │
-│  1. Check Ready Pool size                                  │
-│     cibos-ctl scheduler --ready-pool                        │
-│     If empty, check Stalled List                           │
-│                                                             │
-│  2. Check Stalled List                                     │
-│     cibos-ctl scheduler --stalled                           │
-│     Identify what resources are waited for                  │
-│                                                             │
-│  3. Check resource availability                            │
-│     cibos-ctl resources                                     │
-│     Verify resources are being released                     │
-│                                                             │
-│  4. Check execution contexts                               │
-│     cibos-ctl cores                                         │
-│     Verify contexts are available                           │
-│                                                             │
-│  CONTAINER STALLED:                                         │
-│  1. Check what resource                                    │
-│     cibos-ctl diagnose --container <id>                     │
-│                                                             │
-│  2. Check if resource can be freed                         │
-│     - Memory: Reduce container's usage                      │
-│     - Channel: Clear buffers                                │
-│     - I/O: Wait for completion                              │
-│                                                             │
-│  3. Check for multi-resource stall                         │
-│     Container may need multiple resources                   │
-│     All must be available before moving to Ready Pool      │
-│                                                             │
-│  PERFORMANCE PROBLEMS:                                      │
-│  1. Check weight distribution                              │
-│  2. Check anti-starvation firing frequency                 │
-│  3. Check core utilization                                 │
-│  4. Check Ready Pool depth                                 │
-│  5. Check dispatch statistics                              │
-│                                                             │
-│  SLOW BACKGROUND TASKS:                                     │
-│  1. Check if competition is frequent                       │
-│     If yes, weights matter                                 │
-│     If no, other issue                                     │
-│  2. Check anti-starvation threshold                        │
-│  3. Check for resource constraints                          │
-│  4. Verify background_weight > 0                            │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Signal Coalescence Monitoring
-
-```bash
-cibos-ctl signal-coalescence --stats
-
-Output:
-  Signal buffer size: 23 signals
-  Signals processed this second: 1247
-  Average batch size: 4.2 signals
-  Backstop threshold fires: 3 times
-  Processing overhead: 132 cycles/signal
-
-  Shared timing with anti-starvation: YES
-```
-
-**Interpreting results:**
-
-- High batch size: Good coalescence opportunity
-- Low batch size: Signals arrive spread out
-- Frequent backstop fires: Threshold too high
-- No backstop fires: Threshold appropriate or not needed
-
----
-
-## Chapter 8: Security Operations
-
-### Key Management
-
-```
-KEY MANAGEMENT:
-
-┌─────────────────────────────────────────────────────────────┐
-│                   KEY MANAGEMENT                             │
-│                                                             │
-│  KEY GENERATION:                                           │
-│  cibos-keygen --output /secure/keys                        │
-│                                                             │
-│  KEY STORAGE:                                               │
-│  - Private key: Offline, air-gapped                        │
-│  - Public key: Embedded in CIBIOS                          │
-│  - Backup: Encrypted offline storage                       │
-│                                                             │
-│  KEY ROTATION:                                              │
-│  1. Generate new key pair                                  │
-│  2. Build new CIBIOS with new public key                   │
-│  3. Re-sign all configurations                             │
-│  4. Deploy new CIBIOS                                      │
-│  5. Deploy new configurations                              │
-│  6. Retire old keys                                        │
-│                                                             │
-│  KEY SECURITY:                                              │
-│  - Never store private key on deployed system               │
-│  - Use hardware security module for signing                │
-│  - Audit key usage                                         │
-│  - Implement key escrow for recovery                       │
-│                                                             │
-│  KEY ROTATION SCHEDULE:                                     │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Maximum Isolation: Every 90 days                    │   │
-│  │ Balanced: Every 180 days                            │   │
-│  │ Performance: Every 365 days                         │   │
-│  │ Compute: Before each major deployment               │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Configuration Security
-
-```
-CONFIGURATION SECURITY:
-
-┌─────────────────────────────────────────────────────────────┐
-│              CONFIGURATION SECURITY                          │
-│                                                             │
-│  SIGNING REQUIREMENTS:                                      │
-│  - All profiles accept signed config                        │
-│  - Standard profile: Required                               │
-│  - Lightweight profile: Optional (physical security)        │
-│                                                             │
-│  VERIFICATION:                                              │
-│  - CIBIOS verifies signature at boot                        │
-│  - Invalid signature → compiled defaults                    │
-│  - Missing file → compiled defaults                         │
-│                                                             │
-│  TAMPER DETECTION:                                          │
-│  - Signature verification detects modification             │
-│  - Boot fails if verification fails (Standard)             │
-│  - Warning logged if verification fails (Lightweight)       │
-│                                                             │
-│  AUDIT TRAIL:                                               │
-│  - Log all config load attempts                             │
-│  - Log signature verification results                       │
-│  - Log which config source used                            │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Chapter 9: Troubleshooting
-
-### Common Issues
-
-```
-TROUBLESHOOTING:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    COMMON ISSUES                             │
-│                                                             │
-│  BOOT FAILS - SIGNATURE ERROR:                              │
-│  Cause: Config signature invalid                           │
-│  Check: cibos-verify --config --sig --key                   │
-│  Fix: Re-sign configuration                                 │
-│                                                             │
-│  SYSTEM UNRESPONSIVE:                                       │
-│  Cause: Ready Pool empty, Stalled List full                │
-│  Check: cibos-ctl scheduler --all                           │
-│  Fix: Identify stalled resource, release                    │
-│                                                             │
-│  CONTAINER NEVER EXECUTES:                                  │
-│  Cause: Weight too low or anti-starvation off               │
-│  Check: cibos-ctl container <id> --stats                    │
-│  Fix: Increase weight or enable anti-starvation             │
-│                                                             │
-│  MEMORY ALLOCATION FAILS:                                   │
-│  Cause: Container limit reached                            │
-│  Check: cibos-ctl memory --container <id>                   │
-│  Fix: Increase limit or reduce usage                        │
-│                                                             │
-│  CHANNEL STALLED:                                           │
-│  Cause: Buffer full or empty                               │
-│  Check: cibos-ctl channels --container <id>                 │
-│  Fix: Clear buffers, check receiver/sender                  │
-│                                                             │
-│  PERFORMANCE DEGRADES UNDER LOAD:                           │
-│  Cause: Competition exceeds capacity                        │
-│  Check: Dispatch statistics                                │
-│  Fix: Add execution contexts, tune weights                  │
-│                                                             │
-│  SMT SIDE CHANNELS (Performance/Compute only):              │
-│  Cause: Hardware cache sharing                             │
-│  Check: cibos-ctl cores (SMT enabled)                      │
-│  Fix: Accept (threat model permits) or disable SMT          │
-│                                                             │
-│  SIGNAL COALESCENCE LATENCY TOO HIGH:                       │
-│  Cause: Threshold too high                                 │
-│  Check: cibos-ctl signal-coalescence --stats               │
-│  Fix: Lower backstop_threshold_ms                          │
-│                                                             │
-│  CLASS POOL EXHAUSTED:                                      │
-│  Cause: Pool allocation exceeded                           │
-│  Check: cibos-ctl resource-pools                            │
-│  Fix: Increase pool percentage or reduce usage              │
-│                                                             │
-│  CORE AFFINITY UNBALANCED:                                  │
-│  Cause: Context distribution inappropriate                  │
-│  Check: cibos-ctl core-affinity --stats                     │
-│  Fix: Adjust context counts per class                        │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Recovery Procedures
-
-```
-RECOVERY:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    RECOVERY                                  │
-│                                                             │
-│  SYSTEM HANG:                                               │
-│  1. Check selector thread status                           │
-│  2. Check Ready Pool state                                 │
-│  3. Check Stalled List state                               │
-│  4. Force resource signal                                  │
-│  5. Last resort: reboot                                    │
-│                                                             │
-│  MEMORY EXHAUSTION:                                         │
-│  1. Identify consuming container                           │
-│  2. Reduce container limit                                 │
-│  3. Restart container                                      │
-│  4. Check for leak                                         │
-│                                                             │
-│  CHANNEL DEADLOCK:                                          │
-│  1. Identify blocked containers                            │
-│  2. Check channel buffer states                            │
-│  3. Clear buffers                                          │
-│  4. Restart affected containers                            │
-│                                                             │
-│  CONFIGURATION RECOVERY:                                    │
-│  1. Remove invalid config file                             │
-│  2. System uses compiled defaults                          │
-│  3. Create new signed config                               │
-│  4. Deploy and reboot                                      │
-│                                                             │
-│  FIRMWARE RECOVERY:                                         │
-│  1. Boot from recovery media                              │
-│  2. Flash known-good CIBIOS                                │
-│  3. Flash known-good CIBOS                                 │
-│  4. Deploy known-good config                               │
-│  5. Reboot                                                 │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Chapter 10: Compute Profile Operations
-
-### Compute-Specific Configuration
-
-```
-COMPUTE PROFILE OPERATIONS:
-
-┌─────────────────────────────────────────────────────────────┐
-│                 COMPUTE PROFILE                              │
-│                                                             │
-│  LIGHTWEIGHT HANDSHAKE:                                     │
-│  - No cryptographic verification                           │
-│  - Physical security required                              │
-│  - Config signing optional                                 │
-│                                                             │
-│  PER-LANE WEIGHTS:                                          │
-│  - Container controls weights                              │
-│  - System does not assign weights                          │
-│  - Configure in application code                           │
-│                                                             │
-│  TYPICAL CONFIGURATION:                                     │
-│  [scheduling]                                               │
-│  system_weight = 1  # CLI priority option: 2               │
-│  user_weight = 1                                            │
-│  background_weight = 1                                      │
-│                                                             │
-│  [resources]                                                │
-│  memory_limit_mb = 2048  # Match workload                  │
-│                                                             │
-│  ANTI-STARVATION:                                           │
-│  - Optional (compile flag)                                  │
-│  - Recommended for most workloads                           │
-│  - Disable for pure parallel computation                   │
-│                                                             │
-│  CLI PRIORITY CONFIGURATION:                                │
-│  If interactive monitoring needed:                          │
-│  system_weight = 2  # CLI responsive                       │
-│  user_weight = 1  # Compute lanes                          │
-│                                                             │
-│  UNSIGNED CONFIG (acceptable in air-gapped):                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # /boot/cibos.conf (unsigned)                       │   │
-│  │ [scheduling]                                        │   │
-│  │ system_weight = 1                                   │   │
-│  │ user_weight = 1                                     │   │
-│  │ background_weight = 1                               │   │
-│  │                                                     │   │
-│  │ [resources]                                         │   │
-│  │ memory_limit_mb = 2048                              │   │
-│  │                                                     │   │
-│  │ # No signature section                              │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Monitoring Compute Workloads
-
-```
-COMPUTE MONITORING:
-
-┌─────────────────────────────────────────────────────────────┐
-│                 COMPUTE MONITORING                           │
-│                                                             │
-│  LANE STATUS:                                               │
-│  cibos-ctl lanes --container <id>                           │
-│  Output:                                                    │
-│    Lane 1: READY (weight=1, wait=50ms)                     │
-│    Lane 2: EXECUTING (weight=1)                             │
-│    Lane 3: STALLED (weight=1, waiting: I/O)                │
-│    Lane 4: READY (weight=3, wait=10ms)  # High priority    │
-│                                                             │
-│  THROUGHPUT:                                                │
-│  cibos-ctl throughput --container <id>                      │
-│  Output:                                                    │
-│    Events/sec: 12,450                                       │
-│    Avg wait: 23ms                                           │
-│    Max wait: 145ms                                          │
-│    Anti-starvation rescues: 3                               │
-│                                                             │
-│  RESOURCE USAGE:                                            │
-│  cibos-ctl resources --container <id>                       │
-│  Output:                                                    │
-│    Memory: 1024 / 2048 MB                                  │
-│    I/O pending: 5 operations                                │
-│    Channels: 8 active, 156 pending messages                 │
-│                                                             │
-│  EXECUTION CONTEXT UTILIZATION:                             │
-│  cibos-ctl cores                                            │
-│  Output:                                                    │
-│    Physical Cores: 4                                         │
-│    SMT Factor: 2x (enabled)                                 │
-│    Logical Cores: 8                                          │
-│    Busy: 8  # All cores active (good for compute)           │
-│    Available: 0                                              │
-│                                                             │
-│  INTERPRETING COMPUTE STATS:                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ High events/sec: Good throughput                    │   │
-│  │ Low avg wait: Minimal competition                   │   │
-│  │ High max wait: Some lanes waited long              │   │
-│  │ Anti-starvation rescues: Starvation occurred        │   │
-│  │ All cores busy: System fully utilized              │   │
-│  │ Cores available: More capacity than workload       │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Per-Lane Weight Application
-
-```
-PER-LANE WEIGHTS (APPLICATION LEVEL):
-
-┌─────────────────────────────────────────────────────────────┐
-│               APPLICATION WEIGHT TUNING                      │
-│                                                             │
-│  In Compute profile, applications assign weights            │
-│  to individual lanes at creation time.                      │
-│                                                             │
-│  GUIDELINES:                                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │                                                     │   │
-│  │ High-priority computation (weight 3-5):             │   │
-│  │   - Primary algorithm execution                     │   │
-│  │   - Time-sensitive computations                    │   │
-│  │   - User-facing results                            │   │
-│  │                                                     │   │
-│  │ Normal priority (weight 1):                         │   │
-│  │   - Standard computations                          │   │
-│  │   - Peer computations                             │   │
-│  │   - Parallel algorithm branches                    │   │
-│  │                                                     │   │
-│  │ Low priority (weight 1):                           │   │
-│  │   - Cleanup tasks                                  │   │
-│  │   - Logging/monitoring                             │   │
-│  │   - Background aggregation                         │   │
-│  │                                                     │   │
-│  │ Equal weights:                                     │   │
-│  │   - All lanes are peers                           │   │
-│  │   - Fire-and-wait workflows                        │   │
-│  │   - Maximum entropy selection                      │   │
-│  │                                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  MONITORING PER-LANE BEHAVIOR:                              │
-│  cibos-ctl lanes --container <id> --show-weights            │
-│                                                             │
-│  Look for:                                                  │
-│  - Lanes with high wait times                               │
-│  - Weight imbalance effects                                 │
-│  - Anti-starvation threshold appropriateness                │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Testing Custom Feature Flags
-
-When using custom feature flag combinations (not standard profiles), test thoroughly:
-
-**Verify feature combination is valid:**
-
-```bash
-cargo run --package builder -- --verify-features \
-  --features "anti-starvation,signal-coalescence,per-lane-weights"
-```
-
-**Benchmark with and without optional features:**
-
-```bash
-# Test signal coalescence impact
-cibos-test --throughput --features "signal-coalescence"
-cibos-test --throughput --features ""  # baseline
-
-# Test signal coalescence with threshold
-cibos-test --throughput --features "signal-coalescence,signal-coalescence-threshold"
-cibos-test --throughput --features ""  # baseline
-
-# Test class resource pools impact
-cibos-test --memory-isolation --features "class-resource-pools"
-cibos-test --memory-isolation  # baseline
-
-# Test core affinity impact
-cibos-test --dispatch --features "class-core-affinity"
-cibos-test --dispatch  # baseline
-```
-
-**Measure latency vs throughput trade-off:**
-
-Signal coalescence improves throughput at cost of slightly higher average signal latency. Measure both:
-
-```bash
-cibos-test --latency-throughput --signal-coalescence
-
-Output:
-  Throughput: 12,450 events/sec (+34% vs baseline)
-  Avg latency: 23ms (+5ms vs baseline)
-  P99 latency: 145ms (+12ms vs baseline)
-```
-
----
-
-## Chapter 11: Mobile Device Configuration
-
-### Mobile Feature Set
-
-CIBOS-MOBILE includes additional capability features for mobile devices:
-
-**Required for mobile:**
-- touch-subsystem: Touch input with isolation
-- sensor-subsystem: All sensors with per-sensor isolation
-- display-subsystem: Display control with isolation
-- power-management: Battery and power states
-- cli-interface: Command line
-
-**Optional for mobile:**
-- mobile-connectivity: Cellular, Bluetooth, NFC
-- network-stack: WiFi networking
-- audio-subsystem: Sound input/output
-- gui-subsystem: If GUI framework needed
-
-### Sensor Authorization
-
-Each sensor access requires authorization:
-
-**Camera access:**
-
-```bash
-cibos-ctl sensor --camera --authorize <container-id>
-
-Output:
-  Camera access requested by container <id>
-  User approval required
-  
-  [User approves via GUI/CLI]
-  
-  Camera access granted for container <id>
-  Duration: until container terminates or access revoked
-```
-
-**Microphone access:**
-
-```bash
-cibos-ctl sensor --microphone --authorize <container-id>
-
-Output:
-  Microphone access requested by container <id>
-  Recording indicator will be visible system-wide
-  User approval required
-  
-  [User approves]
-  
-  Microphone access granted
-  Recording indicator active
-```
-
-**GPS access:**
-
-```bash
-cibos-ctl sensor --gps --authorize <container-id> --precision <coarse|fine>
-
-Output:
-  GPS access requested by container <id>
-  Precision: coarse (location within 500m)
-  User approval required
-  
-  [User approves]
-  
-  GPS access granted with coarse precision
-```
-
-### Power Management Configuration
-
-**Battery thresholds:**
-
-```toml
-[power-management]
-# Battery percentage thresholds
-critical_threshold = 5    # System-only execution
-low_threshold = 15       # Background containers throttled
-normal_threshold = 30    # Normal operation
-
-# Per-class power budgets (percentage of available power)
-system_budget = 50       # System containers get half
-user_budget = 40         # User containers get 40%
-background_budget = 10   # Background containers get 10%
-```
-
-**Power state transitions:**
-
-When battery drops below thresholds:
-
-1. Below `normal_threshold`:
-   - Background containers throttled
-   - System containers maintain normal execution
-   - User containers slightly reduced
-
-2. Below `low_threshold`:
-   - Background containers suspended
-   - User containers throttled
-   - System containers maintain execution
-
-3. Below `critical_threshold`:
-   - Only system containers execute
-   - All other containers suspended
-   - System enters low-power mode
-
-### Mobile Connectivity Configuration
-
-**Cellular configuration:**
-
-```toml
-[mobile-connectivity]
-# Cellular radio settings
-cellular_enabled = true
-roaming_allowed = false
-
-# Per-container data limits (MB per day)
-container_data_limit = 100
-```
-
-**Bluetooth configuration:**
-
-```toml
-[mobile-connectivity.bluetooth]
-enabled = true
-discoverable = false
-pairing_required = true
-```
-
-**NFC configuration:**
-
-```toml
-[mobile-connectivity.nfc]
-enabled = true
-secure_element = true
-```
-
----
-
-## Chapter 12: Maintenance
-
-### Updates
-
-```
-MAINTENANCE:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    UPDATES                                   │
-│                                                             │
-│  FIRMWARE UPDATE:                                           │
-│  1. Build new CIBIOS                                       │
-│  2. Flash to device                                        │
-│  3. Verify boot succeeds                                   │
-│  4. Keep backup of previous version                        │
-│                                                             │
-│  KERNEL UPDATE:                                             │
-│  1. Build new CIBOS                                        │
-│  2. Copy to boot media                                     │
-│  3. Update configuration if needed                         │
-│  4. Re-sign if Standard profile                            │
-│                                                             │
-│  CONFIGURATION UPDATE:                                      │
-│  1. Edit cibos.conf                                        │
-│  2. Sign with cibos-sign                                   │
-│  3. Copy to boot media                                     │
-│  4. Reboot to apply                                        │
-│                                                             │
-│  ROLLBACK:                                                  │
-│  Keep previous working:                                     │
-│  - Previous CIBIOS image                                   │
-│  - Previous CIBOS kernel                                   │
-│  - Previous configuration                                  │
-│  Restore if update fails                                   │
-│                                                             │
-│  UPDATE VERIFICATION:                                       │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ 1. Verify boot completes                           │   │
-│  │ 2. Check version numbers                          │   │
-│  │ 3. Verify expected features present                │   │
-│  │ 4. Run acceptance tests                           │   │
-│  │ 5. Monitor for 24 hours                           │   │
-│  │ 6. Archive previous version                       │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Appendix: Configuration Reference
-
-```toml
-# Complete Configuration Reference
+# /boot/cibos.conf
 
 [scheduling]
-# Weight values (positive integers)
-# Maximum Isolation: all must be equal (1:1:1)
-# Other profiles: configurable
+# Weights control selection probability
+# ONLY apply when Ready Pool > execution contexts
 system_weight = 3
 user_weight = 1
 background_weight = 1
 
 # Anti-starvation threshold (milliseconds)
-# Only effective if compiled in (Balanced, Performance)
-# Set to 0 to disable
+# Only effective if compiled in (Balanced and Performance profiles)
+# Tracks ONLY Ready Pool time — stalled time does NOT count
 anti_starvation_threshold_ms = 100
 
 [resources]
 # Per-container memory limit (MB)
-max_memory_per_container_mb = 512
+memory_limit_mb = 512
+io_bandwidth_mbps = 100
 
-# Total application memory percentage
-max_total_application_memory_pct = 80
-
-# Channel limits
-max_channels_per_container = 32
-max_pending_channel_requests = 8
-channel_buffer_default_kb = 64
+[channels]
+max_channels_per_container = 16
+message_queue_size = 256
 
 [signal-coalescence]
 # Enable signal coalescence (if compiled in)
 enabled = true
-
-# Backstop threshold (milliseconds)
-# Process buffered signals after this duration
+# Backstop threshold (milliseconds) — signal processing deadline, NOT dispatch deadline
 backstop_threshold_ms = 5
 
 [resource-pools]
@@ -1889,22 +256,356 @@ background_pool_pct = 10
 
 [core-affinity]
 # Execution context assignment by class (if compiled in)
-# Values must sum to total execution contexts
+# Values must sum to total execution contexts (physical × SMT factor)
 system_contexts = 8
 user_contexts = 7
 background_contexts = 1
 
-[security]
-# Require hardware RNG
-hardware_rng_required = true
+[signature]
+algorithm = "ed25519"
+signature = "<base64-encoded-signature>"
+```
+
+### Configuration Fallback
+
+| Scenario | Result |
+|---|---|
+| Config file missing | Compiled defaults applied, system operational |
+| Config signature invalid | Compiled defaults applied, warning logged, system operational |
+| Config parsed correctly | Signed config values used |
+
+Missing or invalid configuration is NOT a fatal error. System always remains operational.
+
+### Compiled Defaults by Profile
+
+| Profile | system_weight | user_weight | background_weight | anti_starvation |
+|---|---|---|---|---|
+| Maximum Isolation | 1 | 1 | 1 | Not compiled |
+| Balanced | 3 | 1 | 1 | 100ms |
+| Performance | 5 | 2 | 1 | 50ms |
+| Compute | 1 | 1 | 1 | Optional |
+
+### Signing Configuration
+
+```bash
+# Generate keys
+cibos-keygen --output /secure/keys
+
+# Sign configuration
+cibos-sign \
+  --config /boot/cibos.conf \
+  --key /secure/keys/signing.key \
+  --output /boot/cibos.sig
+
+# Verify signature
+cibos-verify \
+  --config /boot/cibos.conf \
+  --sig /boot/cibos.sig \
+  --key /secure/keys/verifying.key
+```
+
+Key management: Private key offline/air-gapped. Public key embedded in CIBIOS at build time. Rotation requires rebuilding CIBIOS with new public key.
+
+**Key rotation schedule:** Maximum Isolation: 90 days. Balanced: 180 days. Performance: 365 days. Compute: Before each major deployment.
+
+---
+
+## Chapter 4: SMT Configuration
+
+CIBIOS configures SMT at boot. CIBOS inherits the configuration. CIBOS cannot change SMT configuration after boot.
+
+| Profile | SMT Default | Security Reason |
+|---|---|---|
+| Maximum Isolation | Disabled | Eliminates hardware side-channels entirely |
+| Balanced | Disabled by default | Security-conscious; user may enable |
+| Performance | Enabled | Maximize throughput on limited hardware |
+| Compute | Enabled | Maximum parallel computation |
+
+**SMT in CIBOS vs traditional systems:** Traditional systems with SMT suffer from thread contention, cache thrashing, and time-slice serialization. CIBOS with SMT has none of these — no locks means no contention; isolated memory means no shared state interference; event-driven dispatch means no time-slicing. SMT in CIBOS adds execution capacity without adding coordination overhead. The only remaining concern is hardware-level cache sharing between logical cores on the same physical core, which is why security-conscious profiles disable SMT.
+
+---
+
+## Chapter 5: Weight Tuning
+
+### Tuning Guidelines
+
+| Symptom | Cause | Solution |
+|---|---|---|
+| UI lagging under load | Window manager selected infrequently | Increase system_weight to 4 or 5 |
+| Background tasks never complete | Low-weight events rarely selected | Enable anti-starvation or increase background_weight to 2 |
+| Unpredictable performance | High entropy in selection | Use more differentiated weights |
+| Observable patterns (Maximum Isolation) | Weights not equal | ALL weights MUST be 1 — security requirement |
+| Anti-starvation fires too often | Threshold too low | Increase anti_starvation_threshold_ms |
+| Anti-starvation never fires | Threshold too high | Decrease anti_starvation_threshold_ms |
+
+### Profile-Specific Weight Guidance
+
+**Maximum Isolation:** DO NOT TUNE WEIGHTS. All weights MUST remain equal (1:1:1). Unequal weights create observable patterns — a security violation.
+
+**Balanced:** Default 3:1:1 works for most workloads. If UI feels sluggish: increase system_weight to 4-5. If background tasks stall: check anti-starvation threshold or increase background_weight to 2. For compute-heavy workloads: reduce system_weight to 2, accept slightly slower UI.
+
+**Performance:** Default 5:2:1 for limited hardware. Very limited (2 cores, 2GB): system=7, user=3, bg=1. Moderate hardware (4 cores, 4GB): system=4, user=2, bg=1. Full fairness ensures all lanes get time eventually — adjust weights for responsiveness preference.
+
+**Compute:** Default equal weights (1:1:1) for maximum entropy and parallel computation. For interactive monitoring: system_weight=2, user_weight=1 provides CLI responsiveness. Per-lane weights (if compiled in) allow application-level fine-grained control. Dynamic weights (if compiled in) allow phase management at runtime.
+
+### Tuning Process
+
+1. Start with profile defaults
+2. Run representative workloads
+3. Observe which components feel slow
+4. Adjust weights incrementally (change by 1 at a time)
+5. Re-run workloads and observe change
+6. Sign new configuration file and deploy
+7. Monitor for unintended effects
+
+---
+
+## Chapter 6: Resource Management
+
+### Memory Limits
+
+When a container reaches its memory limit, allocation stalls (Catch and Release). This is NOT an OOM crash — the container waits invisibly until memory is freed. No retry loop needed.
+
+Choosing values: Browser containers 512-2048 MB. Office applications 128-512 MB. System services 64-256 MB. Compute containers: match workload dataset size.
+
+### Class Resource Pools (When Compiled)
+
+```toml
+[resource-pools]
+system_pool_pct = 40
+user_pool_pct = 50
+background_pool_pct = 10
+```
+
+- System containers allocate ONLY from system_pool
+- User containers allocate ONLY from user_pool
+- Background containers allocate ONLY from background_pool
+- No cross-pool borrowing
+- Pool metadata owned by selector (no locks)
+
+Trade-off: Class pools prevent one class from starving others but may underutilize memory if one pool is idle while another is exhausted.
+
+### Core Affinity Configuration (When Compiled)
+
+```toml
+[core-affinity]
+# Example for 16-context system (8 cores, 2-way SMT)
+system_contexts = 8
+user_contexts = 7
+background_contexts = 1
+```
+
+Routing is deterministic by class. Class membership is not secret information. No locks needed: selector owns routing configuration exclusively.
+
+### Understanding Stalls
+
+Stalls are NOT errors. A container waiting for a resource is in the Stalled List — it waits invisibly and resumes automatically when the resource becomes available.
+
+Common stall causes: Memory limit exceeded (free memory or increase limit), channel buffer full (receiver reads), channel buffer empty (sender writes), I/O operation pending (wait for completion).
+
+Multi-resource stalls: A container may need multiple resources. ALL must be available before the container moves to the Ready Pool. If memory becomes available but channel buffer is still full — container stays stalled.
+
+---
+
+## Chapter 7: Monitoring and Diagnostics
+
+### Key Commands
+
+```bash
+# Scheduler status
+cibos-ctl scheduler
+# Output: Ready Pool size, Stalled List size, core availability, SMT status,
+#         execution contexts
+
+# Dispatch statistics
+cibos-ctl scheduler --stats
+# Output: Dispatch opportunities, no-competition %, competition %,
+#         avg events per dispatch, max simultaneous
+
+# Memory status
+cibos-ctl memory
+
+# Container status
+cibos-ctl containers
+
+# Channel status
+cibos-ctl channels
+
+# Execution contexts
+cibos-ctl cores
+# Output: Physical cores, SMT factor, logical cores, busy/available
+
+# Signal coalescence (if compiled in)
+cibos-ctl signal-coalescence --stats
+
+# Core affinity (if compiled in)
+cibos-ctl core-affinity --stats
+
+# Resource pools (if compiled in)
+cibos-ctl resource-pools
+
+# Diagnose specific container
+cibos-ctl diagnose --container <id>
+
+# Per-lane status (Compute profile)
+cibos-ctl lanes --container <id>
+```
+
+### Interpreting Dispatch Statistics
+
+| Metric | Interpretation |
+|---|---|
+| High no-competition % (>80%) | System handling load well; weights have minimal effect |
+| High competition % (>30%) | Heavy load; weights significantly influence selection; consider more contexts |
+| Low events per dispatch | Small events or high competition |
+| Max simultaneous = context count | Expected; system using all available contexts |
+| Max simultaneous < context count | Light load or resource constraints |
+
+### Common Issues
+
+**Unresponsive system:**
+1. Check Ready Pool — if empty, check Stalled List
+2. Check Stalled List — identify which resources are waited for
+3. Check resource availability — are resources being released?
+4. Check execution contexts — are they available?
+
+**Container stalled:**
+1. `cibos-ctl diagnose --container <id>` — identifies stalled resource
+2. Check if resource can be freed (memory: reduce usage; channel: clear buffers; I/O: wait)
+3. Check for multi-resource stall — ALL required resources must become available simultaneously
+
+**Slow background tasks:**
+1. Check if competition is frequent (if no competition, weights are irrelevant)
+2. Check anti-starvation threshold (if compiled)
+3. Check resource constraints
+4. Verify background_weight > 0
+
+---
+
+## Chapter 8: Compute Profile Operations
+
+### Compute-Specific Configuration
+
+```toml
+# For fire-and-wait workflows (maximum entropy, maximum quantum-like)
+[scheduling]
+system_weight = 1
+user_weight = 1
+background_weight = 1
+
+# For interactive monitoring during computation
+[scheduling]
+system_weight = 2    # CLI remains responsive
+user_weight = 1      # Compute lanes compete fairly
+
+[resources]
+memory_limit_mb = 2048  # Match workload dataset size
+```
+
+### Per-Lane Weights
+
+When `per-lane-weights` is compiled in, applications assign weights at lane creation. High-priority computation (weight 3-5): primary algorithm, time-sensitive, user-facing results. Normal priority (weight 1): parallel branches, peer computations. Equal weights: fire-and-wait workflows, maximum entropy.
+
+### Dynamic Weights
+
+When `dynamic-weights` is compiled in, applications send weight-change messages to the selector at runtime. The selector updates the weight — no locks (selector owns all weight data). Overhead: ~45-110 cycles per change, zero per dispatch.
+
+**When to use:** Scientific computing phases where priority shifts (high weight for data loading, equal weights during parallel computation, high weight for result aggregation).
+
+**When NOT to use:** Any profile with an adversarial observer. Weight change timing is observable and could reveal application state.
+
+### Compute Monitoring
+
+```bash
+cibos-ctl lanes --container <id>       # Per-lane state and weights
+cibos-ctl throughput --container <id>   # Events/sec, wait times
+cibos-ctl resources --container <id>    # Memory, I/O, channels
+cibos-ctl cores                         # All cores busy = good for compute
+```
+
+---
+
+## Chapter 9: Mobile Device Configuration
+
+### Sensor Authorization
+
+All sensor access requires per-access authorization:
+
+```bash
+cibos-ctl sensor --camera --authorize <container-id>
+cibos-ctl sensor --microphone --authorize <container-id>
+cibos-ctl sensor --gps --authorize <container-id> --precision coarse
+```
+
+### Power Management Configuration
+
+```toml
+[power-management]
+critical_threshold = 5      # System-only below this %
+low_threshold = 15           # Background suspended below this %
+normal_threshold = 30        # Normal operation above this %
+
+system_budget = 50           # % of available power for system class
+user_budget = 40
+background_budget = 10
+```
+
+---
+
+## Chapter 10: Maintenance
+
+### Update Procedure
+
+1. Build new CIBIOS/CIBOS
+2. Re-sign configuration if changed
+3. Keep backup of previous working version
+4. Flash CIBIOS firmware
+5. Copy CIBOS kernel to boot media
+6. Verify boot completes
+7. Check version numbers and expected features
+8. Run acceptance tests
+9. Monitor for 24 hours
+10. Archive previous version
+
+---
+
+## Appendix: Complete Configuration Reference
+
+```toml
+# /boot/cibos.conf — Complete Reference
+
+[scheduling]
+system_weight = 3
+user_weight = 1
+background_weight = 1
+anti_starvation_threshold_ms = 100
+
+[resources]
+memory_limit_mb = 512
+io_bandwidth_mbps = 100
+
+[channels]
+max_channels_per_container = 16
+message_queue_size = 256
+
+[signal-coalescence]
+enabled = true
+backstop_threshold_ms = 5
+
+[resource-pools]
+system_pool_pct = 40
+user_pool_pct = 50
+background_pool_pct = 10
+
+[core-affinity]
+system_contexts = 8
+user_contexts = 7
+background_contexts = 1
 
 [power-management]
-# Battery percentage thresholds
 critical_threshold = 5
 low_threshold = 15
 normal_threshold = 30
-
-# Per-class power budgets
 system_budget = 50
 user_budget = 40
 background_budget = 10
@@ -1925,53 +626,9 @@ secure_element = true
 
 [signature]
 algorithm = "ed25519"
-public_key = "<base64-encoded-public-key>"
 signature = "<base64-encoded-signature>"
 ```
 
 ---
 
-## Appendix: Quick Reference Commands
-
-```
-QUICK REFERENCE:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    COMMON COMMANDS                           │
-│                                                             │
-│  System Status:                                             │
-│  cibos-ctl scheduler        # Scheduler state               │
-│  cibos-ctl cores            # Execution contexts           │
-│  cibos-ctl memory           # Memory usage                 │
-│  cibos-ctl containers       # Container states             │
-│  cibos-ctl channels         # Channel states               │
-│  cibos-ctl signal-coalescence # Signal buffer stats         │
-│  cibos-ctl core-affinity    # Core affinity stats          │
-│  cibos-ctl resource-pools   # Memory pool stats            │
-│                                                             │
-│  Diagnostics:                                               │
-│  cibos-ctl diagnose --container <id>                        │
-│  cibos-ctl scheduler --stats                                │
-│  cibos-ctl lanes --container <id>                           │
-│                                                             │
-│  Configuration:                                             │
-│  cibos-sign --config <file> --key <key> --output <sig>     │
-│  cibos-verify --config <file> --sig <sig> --key <key>       │
-│                                                             │
-│  Build:                                                     │
-│  cargo build --profile <profile>                            │
-│  cargo run --package builder -- --verify-features           │
-│                                                             │
-│  Mobile:                                                    │
-│  cibos-ctl sensor --camera --authorize <id>                │
-│  cibos-ctl sensor --microphone --authorize <id>            │
-│  cibos-ctl sensor --gps --authorize <id> --precision coarse │
-│  cibos-ctl power --status                                   │
-│  cibos-ctl connectivity --status                            │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-*This Administrator Guide covers deployment and operations for CIBIOS and CIBOS. For implementation details, see the Developer Guide. For writing applications, see the Application Developer Guide.*
+*For implementation details, see the Developer Guide. For writing applications, see the Application Developer Guide. For security verification, see the Security Analysis Guide.*
