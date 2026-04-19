@@ -9,7 +9,63 @@ This guide assumes familiarity with the HIP README, CIBIOS README, and CIBOS REA
 
 ---
 
-## Chapter 1: Architecture Overview
+## Chapter 1: Repository Architecture
+
+### Directory Structure
+
+```
+repository-root/
+├── Cargo.toml              (workspace root, shared feature flags)
+├── firmware/               (CIBIOS)
+│   ├── Cargo.toml
+│   ├── .cargo/config.toml  (target triples, linker scripts)
+│   ├── linker-x86_64.ld
+│   ├── linker-aarch64.ld
+│   ├── linker-riscv64.ld
+│   ├── linker-x86.ld
+│   ├── build.rs            (assembly compilation)
+│   └── src/
+│       ├── lib.rs
+│       ├── main.rs
+│       ├── allocator.rs    (bump allocator for firmware heap)
+│       ├── serial.rs       (debug output, no OS required)
+│       ├── entropy.rs      (hardware RNG without OS)
+│       ├── arch/
+│       │   ├── x86_64/     (boot.s, memory.s, transfer.s)
+│       │   ├── aarch64/
+│       │   ├── x86/
+│       │   └── riscv64/
+│       ├── core/
+│       │   ├── boot.rs
+│       │   ├── hardware.rs
+│       │   ├── memory.rs
+│       │   ├── isolation.rs
+│       │   ├── smt.rs      (SMT configuration at boot)
+│       │   ├── verification.rs
+│       │   └── handoff.rs
+│       └── security/
+├── kernel/                 (CIBOS)
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs
+│       ├── main.rs
+│       ├── scheduler/
+│       │   ├── mod.rs      (dispatch logic: catch-release + entropy)
+│       │   ├── ready_pool.rs
+│       │   ├── stalled_list.rs
+│       │   ├── selector.rs
+│       │   └── anti_starvation.rs
+│       ├── core/
+│       │   ├── memory.rs
+│       │   ├── ipc.rs
+│       │   ├── isolation.rs
+│       │   └── syscall.rs
+│       └── security/
+├── shared/                 (common types used by both)
+├── platforms/              (architecture-specific code)
+├── tools/                  (build and signing tools)
+└── profiles/               (profile feature flag presets)
+```
 
 ### System Component Diagram
 
@@ -75,10 +131,10 @@ This guide assumes familiarity with the HIP README, CIBIOS README, and CIBOS REA
 │                                                                  │
 │  2. IN READY POOL                                                │
 │     └─► Event has weight assigned                                │
-│         └─► Competing for selection                               │
-│             └─► Weighted entropy selection                        │
-│                 ├─► Selected ──► EXECUTE                         │
-│                 └─► Not selected ──► Stay in READY POOL          │
+│         └─► Competing for dispatch opportunity                   │
+│             └─► Dispatch assessment                               │
+│                 ├─► No competition ──► DISPATCH ALL              │
+│                 └─► Competition ──► Weighted entropy selection   │
 │                                                                  │
 │  3. EXECUTING                                                     │
 │     └─► Event runs on core                                        │
@@ -88,8 +144,9 @@ This guide assumes familiarity with the HIP README, CIBIOS README, and CIBOS REA
 │  4. IN STALLED LIST                                               │
 │     └─► Waiting for resource                                      │
 │         └─► Resource becomes available                            │
-│             └─► Kernel emits signal                               │
-│                 └─► Move to READY POOL                            │
+│             └─► Kernel verifies ALL requirements                  │
+│                 └─► Qualified ──► Move to READY POOL             │
+│                 └─► Not qualified ──► Stay in STALLED LIST       │
 │                                                                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -116,8 +173,8 @@ This guide assumes familiarity with the HIP README, CIBIOS README, and CIBOS REA
            │ Timer: T    │        │ Resource R  │
            └──────┬──────┘        └──────┬──────┘
                   │                      │
-          Selected│                      │Resource Available
-                  │                      │
+          Dispatched│                     │All Resources
+                    │                     │Available
                   ▼                      │
            ┌─────────────┐               │
            │  EXECUTING  │◄──────────────┘
@@ -139,32 +196,193 @@ This guide assumes familiarity with the HIP README, CIBIOS README, and CIBOS REA
 
 ---
 
-## Chapter 2: Catch and Release Implementation
+## Chapter 2: CIBIOS Firmware Implementation
 
-### Ready Pool Data Structure
+### no_std Requirements
+
+CIBIOS is a bare-metal firmware binary. It has no operating system beneath it.
+
+**Required crate-level attributes in lib.rs:**
+```rust
+#![no_std]
+#![no_main]
+#![feature(alloc_error_handler)]
+```
+
+**The allocator problem:** `no_std` provides no allocator by default. CIBIOS provides a bump allocator. This allocator never frees memory — firmware operation is short and all memory is reclaimed at CIBOS handoff.
+
+**The panic problem:** CIBIOS provides its own panic handler that writes to serial and halts.
+
+**The RNG problem:** Standard `rand` crate requires OS. CIBIOS uses hardware RNG directly:
+- **x86_64:** RDRAND instruction (check CPUID leaf 1, ECX bit 30)
+- **ARM64:** RNDR system register (check ID_AA64ISAR0_EL1 RNDR field)
+- **RISC-V:** SEED CSR from Zkr extension
+
+**No async/await anywhere in CIBIOS.** Every function is synchronous. Every call returns `Result<T, FirmwareError>`. The `anyhow` crate requires `std` and is not used.
+
+### CIBIOS Bump Allocator
+
+Static memory region in `.bss` section. Atomic cursor for thread-safety within firmware. Never frees. Heap size: 2MB default, sufficient for all firmware operations.
+
+### Debug Output: Serial Without OS
+
+- **x86_64:** COM1 at I/O port 0x3F8, 115200 baud 8N1
+- **ARM64:** PL011 UART at platform-specific address
+- **RISC-V:** SiFive UART at platform-specific address
+
+Output is write-only, polling-based. No interrupts. No DMA. No OS.
+
+### Linker Scripts
+
+- **x86_64:** Load at 0x100000 (1MB)
+- **ARM64:** Load at 0x40080000
+- **RISC-V:** Load at 0x80000000
+
+The linker script places `_start` first in `.text` to ensure it is at the entry point address.
+
+### build.rs: Assembling Boot Code
+
+```rust
+fn main() {
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let asm_dir = match target_arch.as_str() {
+        "x86_64" => "src/arch/x86_64/asm",
+        "aarch64" => "src/arch/aarch64/asm",
+        "riscv64" => "src/arch/riscv64/asm",
+        "x86" => "src/arch/x86/asm",
+        _ => panic!("Unsupported architecture"),
+    };
+    cc::Build::new()
+        .flag("-x").flag("assembler-with-cpp")
+        .files(/* all .s files in asm_dir */)
+        .compile("cibios_asm");
+}
+```
+
+### SMT Configuration
+
+CIBIOS configures SMT at boot before handoff:
+
+```rust
+pub fn configure_smt(profile: Profile) {
+    match profile {
+        Profile::Standard => {
+            // Disable SMT for Maximum Isolation and Balanced profiles
+            disable_smt_hardware();
+        }
+        Profile::Lightweight => {
+            // Enable SMT for Performance and Compute profiles
+            enable_smt_hardware();
+        }
+    }
+}
+
+fn disable_smt_hardware() {
+    // x86_64: Write to IA32_MISC_ENABLE MSR or use CPUID leaf 0x1F
+    // ARM64: Write to MPIDR_EL1 cluster threading control
+    // RISC-V: Platform-specific hart management
+    architecture_specific_smt_disable();
+}
+```
+
+### CIBIOS Initialization Sequence
+
+1. CPU state initialization (assembly)
+2. BSS zeroing
+3. Serial port initialization for debug output
+4. Hardware RNG availability check
+5. Hardware detection (CPU, memory, storage, display)
+6. Memory isolation boundary configuration
+7. Lane memory region reservation
+8. SMT configuration per profile
+9. Cryptographic engine initialization (Standard profile only)
+10. Boot configuration loading
+11. First boot detection and setup UI (if applicable)
+12. CIBOS image loading from storage
+13. CIBOS image verification (Standard profile only)
+14. CIBOS entry point parsing from ELF header
+15. Isolation boundary finalization
+16. Handoff data structure preparation (including SMT status)
+17. Control transfer to CIBOS
+
+### Handoff Data Structure
+
+```rust
+#[repr(C)]
+pub struct HandoffData {
+    pub version: u32,
+    pub hardware_config: HardwareConfig,
+    pub memory_layout: MemoryLayout,
+    pub isolation_boundaries: IsolationBoundaries,
+    pub smt_enabled: bool,
+    pub logical_core_count: u32,
+    pub physical_core_count: u32,
+    pub verification_chain: VerificationChain, // Standard only
+}
+```
+
+The structure is defined in the `shared` crate with `#[repr(C)]` for binary compatibility.
+
+### Handoff Protocol
+
+**Cryptographic Handoff (Standard Profile):**
 
 ```
-READY POOL STRUCTURE:
-
 ┌─────────────────────────────────────────────────────────────┐
-│                      READY POOL                             │
+│               CRYPTOGRAPHIC HANDOFF                          │
 │                                                             │
-│  Events: [Event₁, Event₂, Event₃, ..., Eventₙ]            │
-│                                                             │
-│  Each Event:                                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Lane ID: UUID                                       │   │
-│  │ Container ID: UUID                                  │   │
-│  │ Weight: u32                                         │   │
-│  │ Entry Time: Instant                                 │   │
-│  │ Accumulated Ready Time: Duration                    │   │
-│  │ Event Payload: ExecutionEvent                       │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  Total Weight: Σ(weightᵢ)                                  │
+│  1. CIBIOS loads CIBOS kernel image                         │
+│  2. CIBIOS computes SHA-256 hash of image                   │
+│  3. CIBIOS verifies Ed25519 signature                       │
+│  4. If verification fails: halt with error                  │
+│  5. CIBIOS prepares HandoffData structure                   │
+│  6. CIBIOS writes HandoffData to known address              │
+│  7. CIBIOS transfers control to CIBOS entry point           │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
+```
 
+**Lightweight Handoff (Lightweight Profile):**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│               LIGHTWEIGHT HANDOFF                            │
+│                                                             │
+│  1. CIBIOS loads CIBOS kernel image                         │
+│  2. CIBIOS prepares HandoffData structure                   │
+│  3. CIBIOS writes HandoffData to known address              │
+│  4. CIBIOS transfers control to CIBOS entry point           │
+│     (No signature verification)                             │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Chapter 3: The Two-Layer Execution Model Implementation
+
+### Layer 1: Catch and Release Data Structures
+
+**Ready Pool:**
+```
+ReadyPool {
+    events: Vec<ReadyEvent>,
+    total_weight: u64,
+}
+
+ReadyEvent {
+    lane_id: Uuid,
+    container_id: Uuid,
+    weight: u32,
+    entry_time: Instant,
+    accumulated_ready_time: Duration,
+    event_payload: ExecutionEvent,
+}
+```
+
+**Ready Pool Operations:**
+
+```
 OPERATIONS:
 
 Add Event:
@@ -178,39 +396,42 @@ Remove Event (by Lane ID):
   3. Remove from events list
   4. Return event
 
-Select Event (Weighted Entropy):
+Select Event (Weighted Entropy - only when competition exists):
   1. Generate random R in [0, total_weight)
   2. Walk events, accumulating weights
   3. Return event where accumulated > R
 ```
 
-### Stalled List Data Structure
+**Stalled List:**
+```
+StalledList {
+    entries: Vec<StalledEntry>,
+    // Indexed by resource type for efficient lookup
+    memory_waiters: HashMap<ContainerId, ResourceRequirements>,
+    io_waiters: HashMap<ContainerId, ResourceRequirements>,
+    channel_waiters: HashMap<ChannelId, Vec<ContainerId>>,
+}
+
+StalledEntry {
+    container_id: Uuid,
+    lane_id: Uuid,
+    resource_requirements: ResourceRequirements, // ALL resources needed
+    stall_time: Instant,
+    pending_event: ExecutionEvent,
+    accumulated_ready_time: Duration, // preserved from Ready Pool
+}
+
+ResourceRequirements {
+    memory_bytes: Option<u64>,
+    channel_reads: Vec<ChannelId>,
+    channel_writes: Vec<ChannelId>,
+    io_operations: Vec<IoOperationId>,
+}
+```
+
+**Stalled List Operations:**
 
 ```
-STALLED LIST STRUCTURE:
-
-┌─────────────────────────────────────────────────────────────┐
-│                      STALLED LIST                           │
-│                                                             │
-│  Entries: [Entry₁, Entry₂, Entry₃, ..., Entryₙ]            │
-│                                                             │
-│  Each Entry:                                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Container ID: UUID                                  │   │
-│  │ Lane ID: UUID                                       │   │
-│  │ Resource Needed: ResourceType                       │   │
-│  │ Stall Time: Instant                                 │   │
-│  │ Pending Event: ExecutionEvent                       │   │
-│  │ Accumulated Ready Time: Duration (preserved)        │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  Index by Resource Type (for efficient lookup):            │
-│  Memory Waiters: [Container IDs]                            │
-│  IO Waiters: [Container IDs]                                │
-│  Channel Waiters: {Channel ID → [Container IDs]}            │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-
 OPERATIONS:
 
 Stall Container:
@@ -220,9 +441,10 @@ Stall Container:
 
 Release for Resource:
   1. Lookup entries waiting for resource
-  2. Remove from entries list
-  3. Remove from resource-type index
-  4. Return entries for Ready Pool
+  2. For each: verify ALL required resources available
+  3. Remove qualified entries from entries list
+  4. Remove from resource-type index
+  5. Return qualified entries for Ready Pool
 
 Find Waiting:
   1. Lookup by resource type
@@ -299,45 +521,56 @@ EVENT STATE MANAGER:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Resource Signal Processing
+### Resource Signal Processing: The Qualification Check
+
+When a resource signal arrives, the processing is NOT "move all waiters." It is "move qualified waiters — those for whom ALL requirements are now satisfied."
 
 ```
 RESOURCE SIGNAL PROCESSING:
 
-┌─────────────────────────────────────────────────────────────┐
-│                   SIGNAL HANDLER                             │
-│                                                             │
-│  Memory Signal:                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ MemoryFreed { container_id, amount }                │   │
-│  │                                                     │   │
-│  │ Process:                                            │   │
-│  │ 1. If container_id: release ContainerMemory         │   │
-│  │ 2. Else: release GlobalMemory                       │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  I/O Signal:                                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ IOComplete { container_id, operation_id }           │   │
-│  │                                                     │   │
-│  │ Process:                                            │   │
-│  │ 1. Release DiskIO or NetworkIO                      │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  Channel Signal:                                            │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ BufferAvailable { channel_id }                      │   │
-│  │ DataAvailable { channel_id }                        │   │
-│  │                                                     │   │
-│  │ Process:                                            │   │
-│  │ 1. Lookup waiters for this channel                  │   │
-│  │ 2. Release to Ready Pool                            │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+signal: ResourceAvailable { resource_type }
 
-INTEGRATION WITH STATE MANAGER:
+1. Find all containers waiting for resource_type
 
+2. FOR EACH container:
+   requirements = container.resource_requirements
+
+   qualified = true
+
+   for each req in requirements.memory_bytes:
+     if memory_registry.available(container) < req:
+       qualified = false; break
+
+   for each channel in requirements.channel_reads:
+     if channel_registry.data_available(channel) == false:
+       qualified = false; break
+
+   for each channel in requirements.channel_writes:
+     if channel_registry.buffer_space(channel) == false:
+       qualified = false; break
+
+   for each io_op in requirements.io_operations:
+     if io_registry.complete(io_op) == false:
+       qualified = false; break
+
+   IF qualified:
+     stalled_list.remove(container)
+     ready_pool.add(ReadyEvent {
+       lane_id: container.lane_id,
+       container_id: container.container_id,
+       weight: container.weight,
+       entry_time: now(),
+       accumulated_ready_time: container.accumulated_ready_time,
+       event_payload: container.pending_event,
+     })
+   ELSE:
+     // Container stays in Stalled List
+     // Update what it's primarily waiting for (optional optimization)
+```
+
+**Integration with State Manager:**
+
+```
 signal_processor_loop():
   while running:
     for signal in pending_signals():
@@ -352,44 +585,77 @@ signal_processor_loop():
           state_manager.resource_available(ChannelData(chid))
 ```
 
+### Layer 2: Dispatch Logic
+
+```
+DISPATCH LOGIC:
+
+TRIGGER: Core completion signal, resource availability, new work created
+
+1. available_contexts = count_available_execution_contexts()
+   // Includes all logical cores that are free (physical × SMT)
+
+2. ready_count = ready_pool.size()
+
+3. IF ready_count == 0: return  // Nothing to dispatch
+
+4. IF ready_count <= available_contexts:
+   // NO COMPETITION — dispatch all
+   FOR each event IN ready_pool.all():
+     context = select_context(event)  // Cache affinity
+     dispatch_to(event, context)
+   // All events dispatched, ready pool now empty
+   return
+
+5. // COMPETITION EXISTS — need selection
+   dispatch_count = available_contexts
+   selected = weighted_entropy_select(ready_pool, dispatch_count)
+   FOR each event IN selected:
+     context = select_context(event)
+     dispatch_to(event, context)
+   // Remaining events stay in ready pool (not stalled)
+```
+
 ---
 
-## Chapter 3: Weighted Entropy Algorithm
+## Chapter 4: Weighted Entropy Algorithm
 
-### Selection Algorithm
+### Selection Algorithm (Called Only When Competition Exists)
 
 ```
 WEIGHTED ENTROPY SELECTION:
 
-┌─────────────────────────────────────────────────────────────┐
-│                   SELECTION ALGORITHM                        │
-│                                                             │
-│  INPUT: ReadyPool with N events                             │
-│  OUTPUT: Selected event                                     │
-│                                                             │
-│  ALGORITHM:                                                 │
-│                                                             │
-│  1. if pool is empty: return None                          │
-│                                                             │
-│  2. total_weight = Σ weightᵢ for all events                │
-│                                                             │
-│  3. if total_weight == 0: return first event               │
-│                                                             │
-│  4. R = random_in_range(0, total_weight)                   │
-│     // Cryptographic entropy source                         │
-│                                                             │
-│  5. accumulated = 0                                         │
-│                                                             │
-│  6. for each event in pool:                                │
-│       accumulated += event.weight                           │
-│       if R < accumulated:                                   │
-│         return event                                        │
-│                                                             │
-│  7. return last event (fallback)                            │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+Input: ReadyPool with N events, need to select K events (K < N)
+Output: K selected events
 
-COMPLEXITY: O(N) where N = number of ready events
+Algorithm (select K from N):
+
+1. IF pool is empty OR K == 0: return []
+
+2. total_weight = Σ weightᵢ for all events in pool
+
+3. IF total_weight == 0: return first K events
+
+4. selected = []
+   pool_copy = copy_of_pool
+
+   FOR i = 0 to K-1:
+     // Generate random value in [0, current_total_weight)
+     R = cryptographic_random_u64() % current_total_weight
+
+     accumulated = 0
+     FOR each event in pool_copy:
+       accumulated += event.weight
+       IF R < accumulated:
+         selected.append(event)
+         pool_copy.remove(event)
+         current_total_weight -= event.weight
+         BREAK inner loop
+
+5. return selected
+
+COMPLEXITY: O(K × N) where N = events in pool, K = events to select
+For typical K = available_contexts and moderate N, this is fast.
 
 OPTIMIZATION: For systems with many events, use prefix-sum tree
 for O(log N) selection.
@@ -400,36 +666,27 @@ for O(log N) selection.
 ```
 SELECTION WITH ANTI-STARVATION:
 
-┌─────────────────────────────────────────────────────────────┐
-│               ANTI-STARVATION SELECTION                      │
-│                                                             │
-│  INPUT: ReadyPool, threshold (Duration), now (Instant)      │
-│  OUTPUT: Selected event                                     │
-│                                                             │
-│  ALGORITHM:                                                 │
-│                                                             │
-│  1. if pool is empty: return None                          │
-│                                                             │
-│  2. // Check for starving events                            │
-│     starving = []                                           │
-│     for each event in pool:                                │
-│       total_wait = event.accumulated_ready_time +           │
-│                    (now - event.entry_time)                 │
-│       if total_wait > threshold:                            │
-│         starving.append(event)                              │
-│                                                             │
-│  3. if starving is not empty:                              │
-│       // Priority selection among starving                  │
-│       // Still use entropy among starving events            │
-│       R = random_in_range(0, len(starving))                │
-│       selected = starving[R]                                │
-│       pool.remove(selected.lane_id)                         │
-│       return selected                                       │
-│                                                             │
-│  4. // Normal weighted entropy selection                    │
-│     return weighted_entropy_select(pool)                    │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+1. Compute current total wait for each event in Ready Pool:
+   total_wait = event.accumulated_ready_time
+                + (now() - event.entry_time)
+
+2. Identify events exceeding threshold:
+   starving = events WHERE total_wait > threshold
+
+3. IF starving is not empty:
+   // Select from starving events first (with entropy among them)
+   priority_count = min(len(starving), available_contexts)
+   priority_selected = entropy_select(starving, priority_count)
+
+   // Fill remaining slots from non-starving events
+   remaining_slots = available_contexts - priority_count
+   IF remaining_slots > 0:
+     non_starving = ready_pool.all() - priority_selected
+     other_selected = weighted_entropy_select(non_starving, remaining_slots)
+
+   return priority_selected + other_selected
+
+4. ELSE: normal weighted entropy selection
 ```
 
 ### Entropy Source
@@ -467,9 +724,9 @@ ENTROPY SOURCE:
 
 ---
 
-## Chapter 4: Anti-Starvation Timer Semantics
+## Chapter 5: Anti-Starvation Timer Semantics
 
-### Timer Fields
+### Timer Fields Per Event
 
 ```
 ANTI-STARVATION TIMER FIELDS:
@@ -495,48 +752,51 @@ ANTI-STARVATION TIMER FIELDS:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Timer Behavior Through Transitions
+### Timer Behavior Through All Transitions
 
+**Event enters Ready Pool (any source — new work or from Stalled List):**
 ```
-TIMER BEHAVIOR THROUGH STATE TRANSITIONS:
+// From INACTIVE (new event)
+accumulated_ready_time = 0
+entry_time = now()
+is_in_ready_pool = true
 
-┌─────────────────────────────────────────────────────────────┐
-│                    STATE TRANSITIONS                         │
-│                                                             │
-│  ENTER READY POOL:                                          │
-│  ─────────────────                                          │
-│  // From INACTIVE (new event)                                │
-│  accumulated_ready_time = 0                                  │
-│  entry_time = now()                                          │
-│  is_in_ready_pool = true                                     │
-│                                                             │
-│  // From STALLED (resource available)                        │
-│  // accumulated_ready_time preserved from stall              │
-│  entry_time = now()                                          │
-│  is_in_ready_pool = true                                     │
-│                                                             │
-│  EXIT READY POOL → EXECUTING:                               │
-│  ─────────────────────────                                   │
-│  // Timer stops accumulating                                │
-│  // accumulated_ready_time NOT modified                     │
-│  // Value preserved for potential future stall               │
-│  is_in_ready_pool = false                                    │
-│                                                             │
-│  EXIT READY POOL → STALLED:                                 │
-│  ─────────────────────────                                   │
-│  // Add current stint to accumulated                         │
-│  accumulated_ready_time += (now() - entry_time)             │
-│  is_in_ready_pool = false                                    │
-│  // Value preserved in StalledEntry                          │
-│                                                             │
-│  COMPLETE EXECUTION → NEW HEAD EVENT:                       │
-│  ─────────────────────────                                   │
-│  // New event becomes head                                   │
-│  accumulated_ready_time = 0  // RESET for new event         │
-│  entry_time = now()                                          │
-│  is_in_ready_pool = true                                     │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+// From STALLED (resource available)
+// accumulated_ready_time preserved from stall
+entry_time = now()
+is_in_ready_pool = true
+```
+
+**Event dispatched from Ready Pool:**
+```
+// accumulated_ready_time NOT updated at this point
+// It is preserved for potential future stall
+// If the event completes and a NEW head event forms,
+// the NEW event starts with accumulated_ready_time = 0
+is_in_ready_pool = false
+```
+
+**Event execution stalls (exits Ready Pool → Stalled List):**
+```
+// Add current stint to accumulated
+accumulated_ready_time += (now() - entry_time)
+is_in_ready_pool = false
+// Value preserved in StalledEntry
+```
+
+**Event returns from Stalled List to Ready Pool:**
+```
+// accumulated_ready_time carried forward from StalledEntry
+entry_time = now()       // new stint begins
+is_in_ready_pool = true
+```
+
+**Event completes and new head event forms:**
+```
+// New event becomes head
+accumulated_ready_time = 0  // RESET for new event
+entry_time = now()
+is_in_ready_pool = true
 ```
 
 ### Current Wait Calculation
@@ -544,22 +804,17 @@ TIMER BEHAVIOR THROUGH STATE TRANSITIONS:
 ```
 CALCULATING CURRENT TOTAL WAIT:
 
-┌─────────────────────────────────────────────────────────────┐
-│                 CURRENT WAIT CALCULATION                     │
-│                                                             │
-│  get_total_ready_wait(event, now):                          │
-│    if event.is_in_ready_pool:                               │
-│      current_stint = now - event.entry_time                 │
-│      return event.accumulated_ready_time + current_stint    │
-│    else:                                                    │
-│      return event.accumulated_ready_time                    │
-│                                                             │
-│  // This correctly returns:                                 │
-│  // - Only Ready Pool time                                  │
-│  // - Does NOT include time spent stalled                   │
-│  // - Accumulates across multiple Ready Pool visits         │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+get_total_ready_wait(event, now):
+  if event.is_in_ready_pool:
+    current_stint = now - event.entry_time
+    return event.accumulated_ready_time + current_stint
+  else:
+    return event.accumulated_ready_time
+
+// This correctly returns:
+// - Only Ready Pool time
+// - Does NOT include time spent stalled
+// - Accumulates across multiple Ready Pool visits
 ```
 
 ### Key Semantic Rules
@@ -598,64 +853,101 @@ SEMANTIC RULES:
 
 ---
 
-## Chapter 5: Multi-Core Single-Pool Routing
+## Chapter 6: Multi-Core Single-Pool Routing
 
 ### Selector Thread Implementation
 
 ```
-SELECTOR THREAD ARCHITECTURE:
+SELECTOR THREAD STATE:
 
-┌─────────────────────────────────────────────────────────────┐
-│                    SELECTOR THREAD                           │
-│                                                             │
-│  STATE:                                                     │
-│  - ready_pool: ReadyPool                                    │
-│  - stalled_list: StalledList                                │
-│  - core_available: [bool; NUM_CORES]                        │
-│  - core_executing: [Option<Uuid>; NUM_CORES]  // Container  │
-│  - from_cores: Receiver<CoreMessage>                        │
-│  - to_cores: [Sender<SelectorMessage>; NUM_CORES]           │
-│  - entropy: KernelEntropy                                   │
-│  - resource_signals: Receiver<ResourceSignal>               │
-│                                                             │
-│  MAIN LOOP:                                                 │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ loop:                                               │   │
-│  │   // Step 1: Process core messages                  │   │
-│  │   while let Ok(msg) = from_cores.try_recv():       │   │
-│  │     match msg:                                      │   │
-│  │       ExecutionComplete { core_id, lane_id }:       │   │
-│  │         core_available[core_id] = true              │   │
-│  │         // Check if more work in lane               │   │
-│  │         if has_next_event(lane_id):                 │   │
-│  │           add_to_pool(get_next_event(lane_id))      │   │
-│  │       ExecutionStalled { core_id, lane_id, res }:   │   │
-│  │         core_available[core_id] = true              │   ��─┤
-│  │         stalled_list.stall(lane_id, res)            │   │
-│  │                                                     │   │
-│  │   // Step 2: Process resource signals               │   │
-│  │   while let Ok(signal) = resource_signals.try_recv():│   │
-│  │     process_resource_signal(signal)                 │   │
-│  │                                                     │   │
-│  │   // Step 3: Process timer events                   │   │
-│  │   for timer in get_fired_timers():                 │   │
-│  │     ready_pool.add(timer_event(timer))              │   │
-│  │                                                     │   │
-│  │   // Step 4: Anti-starvation check                 │   │
-│  │   check_anti_starvation()                           │   │
-│  │                                                     │   │
-│  │   // Step 5: Select and route                       │   │
-│  │   if let Some(core_id) = find_available_core():    │   │
-│  │     if let Some(event) = select_event():            │   │
-│  │       route_event(event, core_id)                   │   │
-│  │       core_available[core_id] = false               │   │
-│  │                                                     │   │
-│  │   // Step 6: Yield if nothing to do                │   │
-│  │   if ready_pool.is_empty() && stalled_list.is_empty():│  │
-│  │     yield()                                         │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+ready_pool: ReadyPool          // Owned exclusively by selector
+stalled_list: StalledList      // Owned exclusively by selector
+core_state: Vec<CoreState>     // Availability and last container
+from_cores: Receiver<CoreMessage>
+to_cores: Vec<Sender<SelectorMessage>>
+resource_signals: Receiver<ResourceSignal>
+entropy: KernelEntropy
+
+SELECTOR MAIN LOOP:
+
+while running {
+    // Step 1: Process core messages (non-blocking drain)
+    while let Ok(msg) = from_cores.try_recv() {
+        match msg {
+            ExecutionComplete { context_id, lane_id, container_id } => {
+                core_state[context_id].available = true;
+                core_state[context_id].last_container = container_id;
+                // Check if this lane has more work
+                if let Some(next) = get_next_lane_event(lane_id) {
+                    if all_resources_available(next) {
+                        ready_pool.add(next);
+                    } else {
+                        stalled_list.add(next);
+                    }
+                }
+            }
+            ExecutionStalled { context_id, lane_id, resources, event } => {
+                core_state[context_id].available = true;
+                // Move to stalled list with preserved accumulated time
+                stalled_list.add(StalledEntry {
+                    accumulated_ready_time: event.accumulated_ready_time,
+                    ...
+                });
+            }
+        }
+    }
+
+    // Step 2: Process resource signals (non-blocking drain)
+    while let Ok(signal) = resource_signals.try_recv() {
+        process_resource_signal(signal); // Moves qualified to Ready Pool
+    }
+
+    // Step 3: Process timer events (application-level timers)
+    for fired_timer in collect_fired_timers() {
+        ready_pool.add(timer_event(fired_timer));
+    }
+
+    // Step 4: Check anti-starvation (if compiled in)
+    #[cfg(feature = "anti-starvation")]
+    mark_starving_events_for_priority();
+
+    // Step 5: Assess and dispatch
+    let available_count = core_state.iter().filter(|c| c.available).count();
+    let ready_count = ready_pool.size();
+
+    if available_count > 0 && ready_count > 0 {
+        if ready_count <= available_count {
+            // No competition: dispatch all
+            for event in ready_pool.drain_all() {
+                let ctx = select_context_affinity(
+                    &event, &core_state
+                );
+                dispatch_event(event, ctx);
+                core_state[ctx].available = false;
+            }
+        } else {
+            // Competition: weighted entropy selection
+            let selected = weighted_entropy_select(
+                &ready_pool,
+                available_count,
+                &mut entropy,
+            );
+            for event in selected {
+                ready_pool.remove(event.lane_id);
+                let ctx = select_context_affinity(
+                    &event, &core_state
+                );
+                dispatch_event(event, ctx);
+                core_state[ctx].available = false;
+            }
+        }
+    }
+
+    // Step 6: Yield if nothing to do
+    if ready_pool.is_empty() && stalled_list.is_empty() {
+        thread::yield_now();
+    }
+}
 ```
 
 ### Core Routing Logic
@@ -753,45 +1045,90 @@ MESSAGE TYPES:
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### Why Single Selector
+
+A single selector is not a bottleneck. Per-dispatch work is bounded:
+- Signal processing: O(signals received)
+- Resource check: O(stalled containers for this resource)
+- Entropy selection: O(K × N) where K = cores, N = ready events
+- Dispatch: O(K)
+
+For typical deployments (4-128 cores, hundreds to thousands of containers), this work completes in microseconds. The selector can handle hundreds of thousands of dispatch decisions per second — orders of magnitude more than typical workloads generate.
+
+Multiple selectors would require:
+- Partitioning the container set (arbitrary, creates load imbalance)
+- Coordinating between selectors (lock-like behavior)
+- Complexity without throughput improvement
+
 ---
 
-## Chapter 6: Configuration System
+## Chapter 7: Execution Capacity: SMT Implementation
+
+### SMT Detection and Configuration
+
+```rust
+pub struct ExecutionCapacity {
+    pub physical_cores: u32,
+    pub smt_factor: u32,
+    pub logical_cores: u32,
+}
+
+impl ExecutionCapacity {
+    pub fn from_handoff(handoff: &HandoffData) -> Self {
+        ExecutionCapacity {
+            physical_cores: handoff.physical_core_count,
+            smt_factor: if handoff.smt_enabled {
+                handoff.logical_core_count / handoff.physical_core_count
+            } else {
+                1
+            },
+            logical_cores: handoff.logical_core_count,
+        }
+    }
+
+    pub fn total_execution_contexts(&self) -> u32 {
+        self.logical_cores
+    }
+}
+```
+
+### Context Availability Tracking
+
+The selector maintains one entry per logical core. Each entry tracks:
+- `available: bool` — is this context free?
+- `last_container: Option<ContainerId>` — for cache affinity
+
+---
+
+## Chapter 8: Configuration System
 
 ### Configuration File Format
 
-```
-CONFIGURATION FILE FORMAT:
+```toml
+# /boot/cibos.conf
 
-┌─────────────────────────────────────────────────────────────┐
-│                 /boot/cibos.conf                             │
-│                                                             │
-│  # CIBOS Boot Configuration                                 │
-│  # This file must be signed with cibos-sign                 │
-│                                                             │
-│  [scheduling]                                               │
-│  # Weight values (positive integers)                        │
-│  system_weight = 3                                          │
-│  user_weight = 1                                            │
-│  background_weight = 1                                      │
-│                                                             │
-│  # Anti-starvation threshold (milliseconds)                 │
-│  # Set to 0 to disable                                      │
-│  anti_starvation_threshold_ms = 100                         │
-│                                                             │
-│  [resources]                                                │
-│  # Per-container limits                                     │
-│  memory_limit_mb = 512                                      │
-│  io_bandwidth_mbps = 100                                    │
-│                                                             │
-│  [channels]                                                 │
-│  max_channels_per_container = 16                            │
-│  message_queue_size = 256                                   │
-│                                                             │
-│  [signature]                                                │
-│  algorithm = "ed25519"                                      │
-│  signature = "<base64-encoded-signature>"                   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+[scheduling]
+# Weight values (positive integers)
+system_weight = 3
+user_weight = 1
+background_weight = 1
+
+# Anti-starvation threshold (milliseconds)
+# Set to 0 to disable
+anti_starvation_threshold_ms = 100
+
+[resources]
+# Per-container limits
+memory_limit_mb = 512
+io_bandwidth_mbps = 100
+
+[channels]
+max_channels_per_container = 16
+message_queue_size = 256
+
+[signature]
+algorithm = "ed25519"
+signature = "<base64-encoded-signature>"
 ```
 
 ### Configuration Loading
@@ -799,53 +1136,48 @@ CONFIGURATION FILE FORMAT:
 ```
 CONFIGURATION LOADING:
 
-┌─────────────────────────────────────────────────────────────┐
-│                 CONFIGURATION LOADER                         │
-│                                                             │
-│  load_config(path, pubkey): Result<Config, Error>           │
-│                                                             │
-│  1. Read config file                                        │
-│  2. Read signature file                                     │
-│  3. Verify signature with embedded public key               │
-│     - If invalid: return Error, use compiled defaults       │
-│     - If missing: use compiled defaults                     │
-│  4. Parse configuration                                    │
-│  5. Validate values:                                       │
-│     - weights > 0                                           │
-│     - threshold >= 0                                        │
-│     - limits reasonable                                     │
-│  6. Return validated config                                │
-│                                                             │
-│  COMPILED DEFAULTS:                                         │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Defaults by Profile:                                 │   │
-│  │                                                     │   │
-│  │ Maximum Isolation:                                  │   │
-│  │   system_weight = 1                                 │   │
-│  │   user_weight = 1                                   │   │
-│  │   background_weight = 1                             │   │
-│  │   anti_starvation = disabled (not compiled)         │   │
-│  │                                                     │   │
-│  │ Balanced:                                            │   │
-│  │   system_weight = 3                                 │   │
-│  │   user_weight = 1                                   │   │
-│  │   background_weight = 1                             │   │
-│  │   anti_starvation = 100ms                           │   │
-│  │                                                     │   │
-│  │ Performance:                                         │   │
-│  │   system_weight = 5                                 │   │
-│  │   user_weight = 2                                   │   │
-│  │   background_weight = 1                             │   │
-│  │   anti_starvation = 50ms                            │   │
-│  │                                                     │   │
-│  │ Compute:                                             │   │
-│  │   system_weight = 1                                 │   │
-│  │   user_weight = 1                                   │   │
-│  │   background_weight = 1                             │   │
-│  │   anti_starvation = optional                        │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+load_config(path, pubkey): Result<Config, Error>
+
+1. Read config file
+2. Read signature file
+3. Verify signature with embedded public key
+   - If invalid: return Error, use compiled defaults
+   - If missing: use compiled defaults
+4. Parse configuration
+5. Validate values:
+   - weights > 0
+   - threshold >= 0
+   - limits reasonable
+6. Return validated config
+
+COMPILED DEFAULTS:
+┌─────────────────────────────────────────────────────┐
+│ Defaults by Profile:                                 │
+│                                                     │
+│ Maximum Isolation:                                  │
+│   system_weight = 1                                 │
+│   user_weight = 1                                   │
+│   background_weight = 1                             │
+│   anti_starvation = disabled (not compiled)         │
+│                                                     │
+│ Balanced:                                            │
+│   system_weight = 3                                 │
+│   user_weight = 1                                   │
+│   background_weight = 1                             │
+│   anti_starvation = 100ms                           │
+│                                                     │
+│ Performance:                                         │
+│   system_weight = 5                                 │
+│   user_weight = 2                                   │
+│   background_weight = 1                             │
+│   anti_starvation = 50ms                            │
+│                                                     │
+│ Compute:                                             │
+│   system_weight = 1                                 │
+│   user_weight = 1                                   │
+│   background_weight = 1                             │
+│   anti_starvation = optional                        │
+└─────────────────────────────────────────────────────┘
 ```
 
 ### Signature Verification
@@ -853,27 +1185,22 @@ CONFIGURATION LOADING:
 ```
 SIGNATURE VERIFICATION:
 
-┌─────────────────────────────────────────────────────────────┐
-│                 SIGNATURE VERIFICATION                       │
-│                                                             │
-│  verify_config(data, signature, pubkey): Result<(), Error>  │
-│                                                             │
-│  1. Parse signature as Ed25519 Signature                   │
-│  2. Verify data with pubkey                                │
-│  3. Return Ok if valid, Error if invalid                  │
-│                                                             │
-│  KEY MANAGEMENT:                                            │
-│  - Public key embedded in CIBIOS at build time             │
-│  - Private key managed externally                          │
-│  - Sign config with: cibos-sign --key priv.pem config      │
-│  - Verify with: cibos-verify --key pub.pem config sig      │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+verify_config(data, signature, pubkey): Result<(), Error>
+
+1. Parse signature as Ed25519 Signature
+2. Verify data with pubkey
+3. Return Ok if valid, Error if invalid
+
+KEY MANAGEMENT:
+- Public key embedded in CIBIOS at build time
+- Private key managed externally
+- Sign config with: cibos-sign --key priv.pem config
+- Verify with: cibos-verify --key pub.pem config sig
 ```
 
 ---
 
-## Chapter 7: Resource Signals
+## Chapter 9: Resource Signals
 
 ### Memory Signal Handling
 
@@ -947,7 +1274,63 @@ CHANNEL SIGNALS:
 
 ---
 
-## Chapter 8: No-Global-Locks Verification
+## Chapter 10: Channel Implementation
+
+### Channel Data Structure
+
+```
+Channel {
+    id: ChannelId,
+    source_container: ContainerId,
+    destination_container: ContainerId,
+    mode: ChannelMode,
+    message_buffer: CircularBuffer,
+    rate_limiter: RateLimiter,
+    lifetime: ChannelLifetime,
+}
+
+ChannelMode {
+    Cryptographic { session_key: [u8; 32] }  // AES-256
+    LightweightHandshake
+}
+```
+
+### Channel Buffer and Catch and Release
+
+When a sender attempts to send and the buffer is full:
+1. Container encounters full buffer during execution
+2. Container signals `ExecutionStalled { resources: [ChannelBuffer(id)] }`
+3. Selector moves container to Stalled List
+4. When receiver reads, freeing buffer space: `ChannelBufferAvailable` signal emitted
+5. Selector processes signal, verifies ALL requirements, moves container to Ready Pool if qualified
+
+When a receiver attempts to receive from an empty buffer:
+1. Container encounters empty buffer during execution
+2. Container signals `ExecutionStalled { resources: [ChannelData(id)] }`
+3. Selector moves container to Stalled List
+4. When sender writes to buffer: `ChannelDataAvailable` signal emitted
+5. Selector processes, qualifies, moves to Ready Pool
+
+---
+
+## Chapter 11: RTRO Implementation
+
+### What RTRO Intercepts
+
+RTRO is compiled into the kernel boundary layer between kernel-internal state and all observable outputs. Observable outputs include system call responses, event log entries, scheduler state queries, and performance counter access.
+
+### RTRO Mechanism
+
+For each observable output:
+1. Kernel computes the actual value
+2. RTRO applies a randomized transformation to the reported value
+3. Transformed value is returned to the observer
+
+The transformation is consistent within a context window (a single process's view in a single invocation) but inconsistent across context windows. RTRO does not modify internal state used for dispatch or resource management.
+
+---
+
+## Chapter 12: No-Global-Locks Verification
 
 ### Verification Principles
 
@@ -975,6 +1358,13 @@ NO-GLOBAL-LOCKS VERIFICATION:
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Ownership Rules
+
+**Selector owns:** Ready Pool, Stalled List, Core state tracking, Resource registry.
+**Execution contexts own:** Their execution state during execution.
+**Containers own:** Their internal event queues.
+**Communication:** Through lock-free message queues (SPSC — one selector writes, one core reads).
 
 ### Code Review Checklist
 
@@ -1040,12 +1430,17 @@ TESTING METHODOLOGY:
 │     No stalls that never resolve                            │
 │     All stalls eventually release = PASS                    │
 │                                                             │
+│  6. DISPATCH MODEL VERIFICATION:                            │
+│     All ready events dispatch when no competition           │
+│     Exactly N events dispatch when competition (N = cores)  │
+│     Weighted entropy used only when competition exists      │
+│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Chapter 9: Profile Build Configuration
+## Chapter 13: Profile Build Configuration
 
 ### Feature Flag Organization
 
@@ -1113,6 +1508,7 @@ PROFILE DEFINITIONS:
 │    "cli-interface",                                         │
 │    "handoff-cryptographic",                                 │
 │  ]                                                          │
+│  smt = "disabled"                                           │
 │                                                             │
 │  BALANCED:                                                  │
 │  features = [                                               │
@@ -1127,6 +1523,7 @@ PROFILE DEFINITIONS:
 │    "handoff-cryptographic",                                 │
 │    # rtro = optional                                        │
 │  ]                                                          │
+│  smt = "disabled" (default, user may enable)                │
 │                                                             │
 │  PERFORMANCE:                                               │
 │  features = [                                               │
@@ -1136,6 +1533,7 @@ PROFILE DEFINITIONS:
 │    "cli-interface",                                         │
 │    "handoff-cryptographic",                                 │
 │  ]                                                          │
+│  smt = "enabled"                                            │
 │                                                             │
 │  COMPUTE:                                                   │
 │  features = [                                               │
@@ -1143,92 +1541,133 @@ PROFILE DEFINITIONS:
 │    "lightweight-handshake",                                 │
 │    "cli-interface",                                         │
 │    "handoff-lightweight",                                   │
+│    "cryptographic-entropy",                                 │
 │    # anti-starvation = optional                             │
-│    # cryptographic-entropy = compiled                       │
 │  ]                                                          │
+│  smt = "enabled"                                            │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
+```
+
+### Feature Flag Files
+
+```toml
+# profiles/maximum-isolation.toml
+[features]
+compile_in = [
+    "rtro",
+    "cryptographic-ipc",
+    "user-authentication",
+    "multi-user-isolation",
+    "audit-logging",
+    "cryptographic-entropy",
+    "hardware-rng",
+    "network-stack",
+    "gui-subsystem",
+    "cli-interface",
+]
+handoff = "handoff-cryptographic"
+smt = "disabled"
+
+[defaults]
+system_weight = 1
+user_weight = 1
+background_weight = 1
+```
+
+```toml
+# profiles/compute.toml
+[features]
+compile_in = [
+    "per-lane-weights",
+    "lightweight-handshake",
+    "cli-interface",
+    "cryptographic-entropy",
+]
+handoff = "handoff-lightweight"
+smt = "enabled"
+
+[defaults]
+system_weight = 1
+user_weight = 1
+background_weight = 1
 ```
 
 ---
 
-## Chapter 10: CIBIOS Implementation Notes
+## Chapter 14: Assembly Integration Reference
 
-### no_std Requirements
+### Assembly Function Naming Convention
 
-```
-NO_STD REQUIREMENTS:
+Pattern: `{arch}_{subsystem}_{operation}`
 
-┌─────────────────────────────────────────────────────────────┐
-│                   CIBIOS CONSTRAINTS                         │
-│                                                             │
-│  NO STANDARD LIBRARY:                                       │
-│  - No std::collections (use heapless or custom)             │
-│  - No std::sync (no Mutex, RwLock, etc.)                    │
-│  - No std::thread (no OS threads)                           │
-│  - No std::net (no OS networking)                           │
-│  - No std::fs (no OS filesystem)                            │
-│  - No std::time (implement hardware timers)                 │
-│  - No std::io (implement serial output)                     │
-│                                                             │
-│  NO ALLOCATOR BY DEFAULT:                                   │
-│  - Implement bump allocator                                │
-│  - Never frees (acceptable for firmware)                    │
-│  - Reset at CIBOS handoff                                  │
-│                                                             │
-│  NO PANIC HANDLER BY DEFAULT:                               │
-│  - Implement custom panic handler                          │
-│  - Write to serial, halt                                   │
-│                                                             │
-│  NO RNG BY DEFAULT:                                         │
-│  - Implement hardware RNG                                  │
-│  - RDRAND (x86_64), RNDR (ARM64), SEED (RISC-V)            │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+Examples:
+- `x86_64_boot_initialize_hardware`
+- `aarch64_memory_setup_isolation`
+- `x86_64_boot_configure_smt`
+- `x86_64_transfer_control_to_os`
 
-### Handoff Protocol
+### Rust FFI Declaration Pattern
 
-```
-HANDOFF PROTOCOL:
+```rust
+mod asm {
+    extern "C" {
+        /// Initialize CPU hardware state at boot.
+        /// Safety: Called once during firmware initialization.
+        pub fn x86_64_boot_initialize_hardware() -> i32;
 
-┌─────────────────────────────────────────────────────────────┐
-│                   HANDOFF PROTOCOL                           │
-│                                                             │
-│  CRYPTOGRAPHIC HANDOFF (Standard Profile):                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ 1. CIBIOS loads CIBOS kernel image                  │   │
-│  │ 2. CIBIOS computes SHA-256 hash of image           │   │
-│  │ 3. CIBIOS verifies Ed25519 signature               │   │
-│  │ 4. If verification fails: halt with error          │   │
-│  │ 5. CIBIOS prepares HandoffData structure           │   │
-│  │ 6. CIBIOS writes HandoffData to known address      │   │
-│  │ 7. CIBIOS transfers control to CIBOS entry point   │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  LIGHTWEIGHT HANDOFF (Lightweight Profile):                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ 1. CIBIOS loads CIBOS kernel image                  │   │
-│  │ 2. CIBIOS prepares HandoffData structure           │   │
-│  │ 3. CIBIOS writes HandoffData to known address      │   │
-│  │ 4. CIBIOS transfers control to CIBOS entry point   │   │
-│  │    (No signature verification)                      │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  HANDOFF DATA STRUCTURE:                                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ struct HandoffData {                                │   │
-│  │   version: u32,                                      │   │
-│  │   hardware_config: HardwareConfig,                   │   │
-│  │   memory_layout: MemoryLayout,                       │   │
-│  │   isolation_boundaries: IsolationBoundaries,        │   │
-│  │   config_ptr: *const Config,                        │   │
-│  │ }                                                   │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+        /// Configure SMT state.
+        /// enable: 0 = disable, 1 = enable
+        /// Safety: Must be called before any core starts execution.
+        pub fn x86_64_boot_configure_smt(enable: u32) -> i32;
+
+        /// Transfer control to CIBOS. Never returns.
+        pub fn x86_64_transfer_control_to_os(
+            entry_point: u64,
+            handoff_data: *const crate::HandoffData,
+        ) -> !;
+    }
+}
 ```
 
 ---
 
-*End of Developer Guide*
+## Appendix: Error Types
+
+### FirmwareError (CIBIOS)
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirmwareError {
+    HardwareInitFailed,
+    MemoryInitFailed,
+    SMTConfigFailed,
+    CryptoInitFailed,
+    IsolationSetupFailed,
+    ConfigLoadFailed,
+    VerificationFailed,
+    SignatureInvalid,
+    StorageReadFailed,
+    HandoffPreparationFailed,
+    OSEntryPointInvalid,
+    UnsupportedArchitecture,
+    InsufficientMemory,
+}
+```
+
+### KernelError (CIBOS)
+
+```rust
+#[derive(Debug)]
+pub enum KernelError {
+    SchedulerError(SchedulerError),
+    MemoryError(MemoryError),
+    IpcError(IpcError),
+    IsolationError(IsolationError),
+    ConfigError(ConfigError),
+}
+```
+
+---
+
+*This Developer Guide covers implementation details for CIBIOS firmware and CIBOS kernel. For deployment guidance, see the Administrator Guide. For application programming, see the Application Developer Guide.*
