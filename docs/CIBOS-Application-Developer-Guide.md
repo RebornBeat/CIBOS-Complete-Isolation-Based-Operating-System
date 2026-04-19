@@ -29,9 +29,22 @@ When your application needs to exchange data with another application, you use c
 
 Channels are your only authorized inter-application communication mechanism. There is no shared memory between applications, no signals, no shared files accessible to both.
 
+### The Two-Layer Execution Model from the Application Perspective
+
+**Layer 1 (Catch and Release):** When your lane has work and all required resources are available, your lane's head event enters the Ready Pool and is eligible for dispatch. If resources are unavailable, your lane stalls invisibly — no retry loops, no spinning.
+
+**Layer 2 (Dispatch):** When your event is in the Ready Pool, the kernel dispatches it either immediately (if execution contexts are available and no competition exists) or after weighted entropy selection (if competition exists). You do not control or observe this process.
+
+### What "Competition" Means for Your Application
+
+Competition exists when more events are ready than execution contexts are available. In practice:
+- On a lightly loaded system, all your ready lanes likely dispatch immediately without selection
+- On a heavily loaded system, weighted entropy may delay some of your lanes
+- Anti-starvation (when compiled) ensures no lane waits indefinitely in the Ready Pool
+
 ### The System Selects Events Probabilistically
 
-When your lane has something ready to execute, the kernel selects your lane's event using weighted entropy selection. You are not guaranteed to be selected immediately. You might be selected very quickly; you might wait through several cycles. The selection is probabilistic, determined by your container's weight class relative to other ready events.
+When your lane has something ready to execute, the kernel selects your lane's event using weighted entropy selection. You are not guaranteed to be selected immediately. You might be selected very quickly; you might wait through several dispatch opportunities. The selection is probabilistic, determined by your container's weight class relative to other ready events.
 
 This is by design. Deterministic selection order would create observable patterns that could be used for timing attacks. Probabilistic selection provides the non-determinism that enables quantum-like computational properties.
 
@@ -79,16 +92,48 @@ LANE CREATION:
 │  │ // Higher weight = higher selection probability     │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
-│  LANE LIFECYCLE:                                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Lane Lifecycle
+
+```
+LANE LIFECYCLE:
+
+┌─────────────────────────────────────────────────────────────┐
+│                    LANE LIFECYCLE                            │
+│                                                             │
+│  1. Created → INACTIVE                                      │
+│  2. Work submitted → Has head event                         │
+│  3. Head event ready → May be selected                      │
+│  4. Selected → EXECUTING                                    │
+│  5. Complete or Stall                                       │
+│  6. If complete and more work → New head event              │
+│  7. If no more work → INACTIVE                              │
+│  8. Destroyed when container ends                           │
+│                                                             │
+│  STATE TRANSITIONS:                                         │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │ 1. Created → INACTIVE                               │   │
-│  │ 2. Work submitted → Has head event                  │   │
-│  │ 3. Head event ready → May be selected               │   │
-│  │ 4. Selected → EXECUTING                             │   │
-│  │ 5. Complete or Stall                                │   │
-│  │ 6. If complete and more work → New head event       │   │
-│  │ 7. If no more work → INACTIVE                       │   │
-│  │ 8. Destroyed when container ends                    │   │
+│  │ INACTIVE                                            │   │
+│  │    ↓ (work submitted)                              │   │
+│  │ READY (in Ready Pool)                              │   │
+│  │    ↓ (selected)                                    │   │
+│  │ EXECUTING                                           │   │
+│  │    ├─→ (completes, more work) → READY              │   │
+│  │    ├─→ (completes, no work) → INACTIVE            │   │
+│  │    └─→ (resource unavailable) → STALLED           │   │
+│  │                                                     │   │
+│  │ STALLED                                             │   │
+│  │    └─→ (resource available) → READY                │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  DESTROYING LANES:                                          │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ // Graceful destroy (waits for current event)       │   │
+│  │ lane.destroy()?;                                     │   │
+│  │                                                     │   │
+│  │ // Immediate destroy (cancels pending)              │   │
+│  │ lane.destroy_immediate()?;                           │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
@@ -178,6 +223,10 @@ LANE FIFO ORDERING:
 │  │ Selection is by weighted entropy                    │   │
 │  │ Order is non-deterministic                          │   │
 │  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  KEY INSIGHT:                                               │
+│  If you need ordering across lanes, use channels           │
+│  to coordinate between them.                                │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -314,20 +363,21 @@ CREATING CHANNELS:
 │  │ // Accept with original terms                        │   │
 │  │ let channel = incoming.accept()?;                   │   │
 │  │                                                      │   │
-│  │ // Or accept with modified terms                     │   │
-│  │ let channel = incoming.accept_with(|terms| {        │   │
-│  │     ChannelTerms {                                  │   │
-│  │         rate_limit: Some(RateLimit::MessagesPerSec(500)),│
-│  │         ..terms.clone()                              │   │
-│  │     }                                               │   │
-│  │ })?;                                                 │   │
-│  │                                                      │   │
 │  │ // Or reject                                         │   │
 │  │ incoming.reject(Some("Reason"));                    │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Channel Terms Are Not Negotiable
+
+**Important:** B cannot modify terms and send a counter-proposal. The options are accept-all or reject. If different terms are needed:
+1. B rejects
+2. A sends a new request with modified terms
+3. B accepts or rejects the new request
+
+This is application-level logic, not kernel negotiation. Terms are defined by the proposing application's design and are not dynamically negotiable between applications.
 
 ### Sending and Receiving Messages
 
@@ -445,7 +495,7 @@ CHANNEL ERRORS:
 │  │     Err(e) => {                                      │   │
 │  │         // Other error                               │   │
 │  │         log::error!("Channel error: {}", e);        │   │
-│  │     }                                               │     │
+│  │     }                                               │   │
 │  │ }                                                    │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
@@ -495,6 +545,21 @@ RESOURCES:
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
+```
+
+### Stalls Are Transparent
+
+When your application stalls, you do not need to detect or handle it. Your application's execution simply pauses at the stalling operation and resumes when the resource becomes available. There are no retry loops needed. The kernel handles everything.
+
+```rust
+// This is wrong — never do this
+while !resource_available() {
+    sleep(10ms);
+}
+
+// This is right — let the kernel handle it
+let data = allocate(size).await?;
+// If unavailable, stalls transparently until available
 ```
 
 ### Designing for Resource Constraints
@@ -594,9 +659,31 @@ EXECUTION LATENCY:
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### Timer-Based Operations
+
+```rust
+// Sleep for 100 milliseconds
+Timer::sleep(Duration::from_millis(100)).await;
+
+// Set a timeout on an operation
+let result = with_timeout(Duration::from_secs(5), async {
+    channel.receive().await
+}).await;
+
+match result {
+    Ok(Ok(message)) => process(message),
+    Ok(Err(e)) => handle_channel_error(e),
+    Err(TimeoutError) => handle_timeout(),
+}
+```
+
+Timers work through the kernel's timer event mechanism. When you call `sleep`, the kernel registers a timer event. When the timer fires, the timer event enters the Ready Pool and your lane competes for dispatch. You do not hold CPU while sleeping.
+
 ---
 
 ## Chapter 5: Quantum-Like Programming Patterns
+
+CIBOS's lane architecture enables quantum-like parallel computation. All lane results are preserved — there is no collapse. One run is sufficient.
 
 ### Parallel Pathway Maintenance
 
@@ -792,7 +879,7 @@ RESOLUTION:
 │  │                                                      │   │
 │  │ // Application decides how to resolve                │   │
 │  │                                                      │   │
-│  │ // Option 1: Take first result                       │
+│  │ // Option 1: Take first result                       │   │
 │  │ let first = results.into_iter().next()?;             │   │
 │  │                                                      │   │
 │  │ // Option 2: Take best result                        │   │
@@ -979,6 +1066,13 @@ GRACEFUL DEGRADATION:
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### Application Crashes
+
+If your application crashes (panic, illegal memory access, unhandled error), the kernel isolates the crash to your container. Other applications continue running. Design for graceful degradation:
+- Handle errors explicitly rather than panicking
+- Log errors to your application's storage before they become fatal
+- Implement restart logic that recovers from partial state
+
 ---
 
 ## Chapter 8: Debugging
@@ -1115,70 +1209,63 @@ PITFALLS:
 
 ---
 
-## Chapter 9: Compute Profile Specifics
+## Chapter 9: Security Considerations for Application Developers
 
-### Lightweight Handshake
+### What Isolation Provides
 
-```
-LIGHTWEIGHT HANDSHAKE:
+Your application's memory is private by architecture. Your application's execution timing is not observable by other applications. Your communication is through explicitly established channels that you control.
 
-┌─────────────────────────────────────────────────────────────┐
-│                  LIGHTWEIGHT HANDSHAKE                       │
-│                                                             │
-│  WHAT IT MEANS:                                             │
-│  - Channels established without per-message verification    │
-│  - No cryptographic overhead                                │
-│  - Identity established once at channel creation           │
-│  - Trust through physical security                         │
-│                                                             │
-│  IMPLICATIONS:                                              │
-│  - Faster message passing                                  │
-│  - No signature verification                               │
-│  - Appropriate for air-gapped systems                      │
-│  - Requires physical security perimeter                    │
-│                                                             │
-│  APPLICATION CODE:                                          │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Same channel API                                  │   │
-│  │ let channel = Channel::request(request).await?;      │   │
-│  │                                                      │   │
-│  │ // Messages flow without verification                │   │
-│  │ channel.send(message).await?;                        │   │
-│  │ let response = channel.receive().await?;             │   │
-│  │                                                      │   │
-│  │ // No application code changes                       │   │
-│  │ // Mode is system configuration                      │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+### What Applications Still Need to Handle
+
+**Channel-borne data:** Messages received on channels come from the other application. Validate all input received through channels.
+
+**File system data:** Data read from storage was written at some prior time. Validate stored data on read.
+
+**External data:** Any data entering your application from outside must be treated as potentially malformed.
+
+---
+
+## Chapter 10: Compute Profile Specifics
+
+### Lightweight Handshake Communication
+
+Compute profile uses lightweight handshake IPC. Channel establishment verifies identity once. Subsequent messages flow without per-message cryptographic overhead. This is not a security compromise in an air-gapped, single-user environment.
+
+Application code is identical regardless of IPC mode — the system configuration determines which mode is in use.
 
 ### No RTRO
 
-```
-NO RTRO:
+Compute profile has no RTRO. System metrics (CPU usage, memory usage, event timing) are accurate. This is beneficial for performance analysis and workload monitoring.
 
-┌─────────────────────────────────────────────────────────────┐
-│                      NO RTRO                                 │
-│                                                             │
-│  WHAT IT MEANS:                                             │
-│  - Behavioral signals are observable                        │
-│  - CPU usage reports are accurate                           │
-│  - Memory usage reports are accurate                        │
-│  - Timing is not obfuscated                                 │
-│                                                             │
-│  IMPLICATIONS:                                              │
-│  - Better for performance analysis                          │
-│  - Observable for debugging                                 │
-│  - No overhead from obfuscation layer                       │
-│                                                             │
-│  APPLICATION IMPACT:                                        │
-│  - None for application code                               │
-│  - Only affects system metrics visibility                   │
-│  - RTRO is system configuration                            │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+### Maximum Computation Throughput
+
+The combination of:
+- Equal weights (or per-lane weights) maximizing selection fairness
+- No RTRO overhead
+- Lightweight handshake (no per-message cryptographic overhead)
+- SMT enabled (maximum execution contexts)
+- Anti-starvation optional (minimal or no overhead)
+
+...makes Compute profile the highest-throughput configuration for parallel computation workloads.
+
+---
+
+## Chapter 11: Application State and Persistence
+
+### Your Isolation Boundary
+
+Your container's memory is private by architecture. No other application can read or write it. All shared state with other applications must go through channels.
+
+### Persistent State
+
+Applications can write persistent state to storage through the file system interface. Each application sees only its authorized file system region. Storage access goes through the kernel's I/O system and may cause stalls.
+
+### State Across Application Restart
+
+When your container restarts (crash or intentional restart), memory state is lost. Design for graceful restarts:
+- Write checkpoints to storage periodically for long-running computations
+- On startup, check for a checkpoint and resume from it if found
+- Handle the case where no checkpoint exists (fresh start)
 
 ---
 
@@ -1189,10 +1276,10 @@ NO RTRO:
 | Operation | Description |
 |---|---|
 | `Lane::create()` | Create lane with container's weight class |
-| `Lane::create_with_weight(n)` | Create lane with explicit weight (Compute only) |
+| `Lane::create_with_weight(n)` | Create lane with explicit weight (Compute profile) |
 | `lane.submit(future)` | Submit async event to lane |
 | `lane.destroy()` | Destroy lane after current event completes |
-| `lane.destroy_immediate()` | Destroy lane immediately, cancel pending |
+| `lane.destroy_immediate()` | Destroy lane immediately, cancel pending events |
 
 ### Channel Operations
 
@@ -1200,28 +1287,29 @@ NO RTRO:
 |---|---|
 | `Channel::request(request)` | Request channel (awaits acceptance) |
 | `container.await_channel_request()` | Wait for incoming request |
-| `incoming.accept()` | Accept request |
-| `channel.send(msg).await` | Send message (stalls if buffer full) |
+| `incoming.accept()` | Accept all proposed terms |
+| `incoming.reject()` | Reject the request |
+| `channel.send(data).await` | Send message (stalls if buffer full) |
 | `channel.receive().await` | Receive message (stalls if buffer empty) |
 | `channel.try_receive()` | Non-blocking receive |
-| `channel.close()` | Close channel |
+| `channel.close()` | Close the channel |
 
 ### Timer Operations
 
 | Operation | Description |
 |---|---|
-| `Timer::sleep(dur).await` | Sleep for duration |
-| `Timer::at(instant).await` | Sleep until instant |
-| `timeout(dur, future).await` | Run with timeout |
+| `Timer::sleep(duration).await` | Sleep for specified duration |
+| `Timer::at(instant).await` | Sleep until specified instant |
+| `with_timeout(duration, future).await` | Run future with timeout |
 
-### Resource Queries
+### Resource Query
 
 | Operation | Description |
 |---|---|
 | `container.memory_usage()` | Current memory usage |
-| `container.memory_limit()` | Memory limit |
-| `container.channel_count()` | Active channels |
+| `container.memory_limit()` | Memory limit for this container |
+| `container.channel_count()` | Number of active channels |
 
 ---
 
-*End of Application Developer Guide*
+*This Application Developer Guide covers writing applications for CIBOS. For system implementation details, see the Developer Guide. For deployment configuration, see the Administrator Guide.*
