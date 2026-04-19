@@ -59,6 +59,7 @@ PROFILE SUMMARY:
 │  │ Network: Yes                                         │   │
 │  │ Multi-user: Yes                                      │   │
 │  │ Handoff: Cryptographic                               │   │
+│  │ Optional features: None recommended                  │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
 │  BALANCED:                                                  │
@@ -72,6 +73,9 @@ PROFILE SUMMARY:
 │  │ Network: Yes                                         │   │
 │  │ Multi-user: Optional                                 │   │
 │  │ Handoff: Cryptographic                               │   │
+│  │ Optional features: rtro, signal-coalescence,         │   │
+│  │   signal-coalescence-threshold, class-resource-pools,│   │
+│  │   class-core-affinity                                │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
 │  PERFORMANCE:                                               │
@@ -85,6 +89,9 @@ PROFILE SUMMARY:
 │  │ Network: Optional                                    │   │
 │  │ Multi-user: No                                       │   │
 │  │ Handoff: Cryptographic                               │   │
+│  │ Optional features: signal-coalescence,               │   │
+│  │   signal-coalescence-threshold, class-resource-pools,│   │
+│  │   class-core-affinity                                │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
 │  COMPUTE:                                                   │
@@ -98,6 +105,9 @@ PROFILE SUMMARY:
 │  │ Network: No                                          │   │
 │  │ Multi-user: No                                       │   │
 │  │ Handoff: Lightweight                                 │   │
+│  │ Optional features: anti-starvation, signal-coalescence│   │
+│  │   signal-coalescence-threshold, class-resource-pools,│   │
+│  │   class-core-affinity                                │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
@@ -144,6 +154,17 @@ HARDWARE REQUIREMENTS BY PROFILE:
 │  │ Reason: Minimal overhead for computation            │   │
 │  │          Scales with workload, not profile           │   │
 │  │          SMT enabled for max parallelism            │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  MOBILE (CIBOS-MOBILE):                                     │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Minimum: 2 cores, 1 GB RAM, 4 GB storage            │   │
+│  │ Recommended: 4+ cores, 2+ GB RAM, 8+ GB storage     │   │
+│  │ Reason: Sensor subsystem overhead                   │   │
+│  │          Touch subsystem requires responsiveness    │   │
+│  │          Power management for battery life          │   │
+│  │          Recommended profiles: Maximum Isolation,   │   │
+│  │          Balanced (not Compute)                      │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
@@ -339,6 +360,28 @@ CONFIGURATION FILE:
 │  [channels]                                                 │
 │  max_channels_per_container = 16                            │
 │  message_queue_size = 256                                   │
+│                                                             │
+│  [signal-coalescence]                                       │
+│  # Enable signal coalescence (if compiled in)               │
+│  enabled = true                                             │
+│                                                             │
+│  # Backstop threshold (milliseconds)                        │
+│  # Process buffered signals after this duration             │
+│  backstop_threshold_ms = 5                                  │
+│                                                             │
+│  [resource-pools]                                           │
+│  # Per-class memory pools (if compiled in)                  │
+│  # Percentages must sum to 100                              │
+│  system_pool_pct = 40                                       │
+│  user_pool_pct = 50                                         │
+│  background_pool_pct = 10                                   │
+│                                                             │
+│  [core-affinity]                                            │
+│  # Execution context assignment by class (if compiled in)   │
+│  # Values must sum to total execution contexts              │
+│  system_contexts = 8                                        │
+│  user_contexts = 7                                          │
+│  background_contexts = 1                                     │
 │                                                             │
 │  [signature]                                                │
 │  algorithm = "ed25519"                                      │
@@ -552,6 +595,14 @@ SMT CONFIGURATION BY PROFILE:
 │  │ Reason: Maximum parallel computation                │   │
 │  │ Trade-off: Hardware side channels present           │   │
 │  │           Acceptable for air-gapped environment      │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  MOBILE (CIBOS-MOBILE):                                     │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ SMT: DISABLED by default (user may enable)           │   │
+│  │ Reason: Security-conscious default for mobile       │   │
+│  │ Note: Can enable for performance on capable hardware │   │
+│  │ Battery impact: SMT may increase power consumption   │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
@@ -768,6 +819,141 @@ PROFILE-SPECIFIC TUNING:
 5. Re-run workloads and observe change
 6. Sign new configuration file and deploy
 7. Monitor for unintended effects
+
+### Signal Coalescence Configuration
+
+Signal coalescence is an optional feature that improves throughput by processing multiple resource signals together:
+
+**Configuration:**
+
+```toml
+[signal-coalescence]
+# Enable signal coalescence (if compiled in)
+enabled = true
+
+# Optional: backstop threshold in milliseconds
+# If signals buffered longer than threshold, process immediately
+backstop_threshold_ms = 5
+```
+
+**Trade-offs:**
+
+| Metric | Without Coalescence | With Coalescence |
+|--------|---------------------|------------------|
+| Throughput | Baseline | +30-50% |
+| Average latency | Lower | Slightly higher |
+| Signal processing overhead | ~400 cycles/signal | ~125 cycles/signal |
+| Complexity | Simpler | Moderate |
+
+**Interaction with anti-starvation:**
+
+If both `signal-coalescence-threshold` and `anti-starvation` are compiled in, they share timing infrastructure. No additional configuration needed - the sharing is automatic.
+
+**Benchmarking:**
+
+1. Run baseline test without coalescence
+2. Enable coalescence, run same test
+3. Compare throughput and latency
+4. Adjust threshold if needed
+
+```bash
+# Test without coalescence
+cibos-test --throughput --duration 60s
+
+# Test with coalescence
+cibos-test --throughput --duration 60s --signal-coalescence
+
+# Compare results
+```
+
+### Class Resource Pools Configuration
+
+When `class-resource-pools` is compiled in, you can configure per-class memory isolation:
+
+**Configuration:**
+
+```toml
+[resource-pools]
+# Percentage of total RAM per class
+# Must sum to 100
+system_pool_pct = 40
+user_pool_pct = 50
+background_pool_pct = 10
+```
+
+**What this does:**
+
+- System class containers allocate from system_pool only
+- User class containers allocate from user_pool only
+- Background class containers allocate from background_pool only
+- No cross-pool borrowing
+
+**When to use:**
+
+- System running critical services that must not be starved
+- Multi-user systems with user isolation requirements
+- Workloads where class isolation is more important than utilization
+
+**Trade-offs:**
+
+| Aspect | With Class Pools | Without Class Pools |
+|--------|------------------|---------------------|
+| Isolation | Strong per-class | Global sharing |
+| Utilization | May underutilize | Maximum utilization |
+| Starvation | Impossible across classes | Possible across classes |
+| Configuration | More complex | Simpler |
+
+### Core Assignation by Class Configuration
+
+When `class-core-affinity` is compiled in, you can assign execution contexts to weight classes:
+
+**Configuration:**
+
+```toml
+[core-affinity]
+# Number of execution contexts per class
+# Must sum to total execution contexts (physical cores × SMT factor)
+
+# Example for 8-core system with 2-way SMT = 16 contexts
+system_contexts = 8      # Half for system class
+user_contexts = 7        # Most of remainder for user class
+background_contexts = 1   # Minimal for background
+```
+
+**What this does:**
+
+- System events dispatch only to system_contexts
+- User events dispatch only to user_contexts
+- Background events dispatch only to background_contexts
+
+**No added complexity:**
+- Same selector logic
+- Same single pool
+- Only adds class as routing consideration
+- Existing cache affinity works within each class pool
+
+**When to use:**
+
+- Guaranteeing responsiveness for system services
+- Isolating user workloads from system overhead
+- Ensuring background tasks don't impact foreground
+
+**Monitoring:**
+
+```bash
+cibos-ctl core-affinity --stats
+
+Output:
+  System contexts: 0-7 (8 contexts)
+    Utilization: 45%
+    Avg dispatch latency: 12ms
+  User contexts: 8-14 (7 contexts)
+    Utilization: 78%
+    Avg dispatch latency: 34ms
+  Background contexts: 15 (1 context)
+    Utilization: 92%
+    Avg dispatch latency: 156ms
+```
 
 ---
 
@@ -1052,11 +1238,33 @@ DIAGNOSTICS:
 │     If yes, weights matter                                 │
 │     If no, other issue                                     │
 │  2. Check anti-starvation threshold                        │
-│ 3. Check for resource constraints                          │
-│ 4. Verify background_weight > 0                            │
+│  3. Check for resource constraints                          │
+│  4. Verify background_weight > 0                            │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Signal Coalescence Monitoring
+
+```bash
+cibos-ctl signal-coalescence --stats
+
+Output:
+  Signal buffer size: 23 signals
+  Signals processed this second: 1247
+  Average batch size: 4.2 signals
+  Backstop threshold fires: 3 times
+  Processing overhead: 132 cycles/signal
+
+  Shared timing with anti-starvation: YES
+```
+
+**Interpreting results:**
+
+- High batch size: Good coalescence opportunity
+- Low batch size: Signals arrive spread out
+- Frequent backstop fires: Threshold too high
+- No backstop fires: Threshold appropriate or not needed
 
 ---
 
@@ -1181,6 +1389,21 @@ TROUBLESHOOTING:
 │  Check: cibos-ctl cores (SMT enabled)                      │
 │  Fix: Accept (threat model permits) or disable SMT          │
 │                                                             │
+│  SIGNAL COALESCENCE LATENCY TOO HIGH:                       │
+│  Cause: Threshold too high                                 │
+│  Check: cibos-ctl signal-coalescence --stats               │
+│  Fix: Lower backstop_threshold_ms                          │
+│                                                             │
+│  CLASS POOL EXHAUSTED:                                      │
+│  Cause: Pool allocation exceeded                           │
+│  Check: cibos-ctl resource-pools                            │
+│  Fix: Increase pool percentage or reduce usage              │
+│                                                             │
+│  CORE AFFINITY UNBALANCED:                                  │
+│  Cause: Context distribution inappropriate                  │
+│  Check: cibos-ctl core-affinity --stats                     │
+│  Fix: Adjust context counts per class                        │
+│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -1220,7 +1443,7 @@ RECOVERY:
 │  FIRMWARE RECOVERY:                                         │
 │  1. Boot from recovery media                              │
 │  2. Flash known-good CIBIOS                                │
-│ 3. Flash known-good CIBOS                                  │
+│  3. Flash known-good CIBOS                                 │
 │  4. Deploy known-good config                               │
 │  5. Reboot                                                 │
 │                                                             │
@@ -1385,9 +1608,191 @@ PER-LANE WEIGHTS (APPLICATION LEVEL):
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### Testing Custom Feature Flags
+
+When using custom feature flag combinations (not standard profiles), test thoroughly:
+
+**Verify feature combination is valid:**
+
+```bash
+cargo run --package builder -- --verify-features \
+  --features "anti-starvation,signal-coalescence,per-lane-weights"
+```
+
+**Benchmark with and without optional features:**
+
+```bash
+# Test signal coalescence impact
+cibos-test --throughput --features "signal-coalescence"
+cibos-test --throughput --features ""  # baseline
+
+# Test signal coalescence with threshold
+cibos-test --throughput --features "signal-coalescence,signal-coalescence-threshold"
+cibos-test --throughput --features ""  # baseline
+
+# Test class resource pools impact
+cibos-test --memory-isolation --features "class-resource-pools"
+cibos-test --memory-isolation  # baseline
+
+# Test core affinity impact
+cibos-test --dispatch --features "class-core-affinity"
+cibos-test --dispatch  # baseline
+```
+
+**Measure latency vs throughput trade-off:**
+
+Signal coalescence improves throughput at cost of slightly higher average signal latency. Measure both:
+
+```bash
+cibos-test --latency-throughput --signal-coalescence
+
+Output:
+  Throughput: 12,450 events/sec (+34% vs baseline)
+  Avg latency: 23ms (+5ms vs baseline)
+  P99 latency: 145ms (+12ms vs baseline)
+```
+
 ---
 
-## Chapter 11: Maintenance
+## Chapter 11: Mobile Device Configuration
+
+### Mobile Feature Set
+
+CIBOS-MOBILE includes additional capability features for mobile devices:
+
+**Required for mobile:**
+- touch-subsystem: Touch input with isolation
+- sensor-subsystem: All sensors with per-sensor isolation
+- display-subsystem: Display control with isolation
+- power-management: Battery and power states
+- cli-interface: Command line
+
+**Optional for mobile:**
+- mobile-connectivity: Cellular, Bluetooth, NFC
+- network-stack: WiFi networking
+- audio-subsystem: Sound input/output
+- gui-subsystem: If GUI framework needed
+
+### Sensor Authorization
+
+Each sensor access requires authorization:
+
+**Camera access:**
+
+```bash
+cibos-ctl sensor --camera --authorize <container-id>
+
+Output:
+  Camera access requested by container <id>
+  User approval required
+  
+  [User approves via GUI/CLI]
+  
+  Camera access granted for container <id>
+  Duration: until container terminates or access revoked
+```
+
+**Microphone access:**
+
+```bash
+cibos-ctl sensor --microphone --authorize <container-id>
+
+Output:
+  Microphone access requested by container <id>
+  Recording indicator will be visible system-wide
+  User approval required
+  
+  [User approves]
+  
+  Microphone access granted
+  Recording indicator active
+```
+
+**GPS access:**
+
+```bash
+cibos-ctl sensor --gps --authorize <container-id> --precision <coarse|fine>
+
+Output:
+  GPS access requested by container <id>
+  Precision: coarse (location within 500m)
+  User approval required
+  
+  [User approves]
+  
+  GPS access granted with coarse precision
+```
+
+### Power Management Configuration
+
+**Battery thresholds:**
+
+```toml
+[power-management]
+# Battery percentage thresholds
+critical_threshold = 5    # System-only execution
+low_threshold = 15       # Background containers throttled
+normal_threshold = 30    # Normal operation
+
+# Per-class power budgets (percentage of available power)
+system_budget = 50       # System containers get half
+user_budget = 40         # User containers get 40%
+background_budget = 10   # Background containers get 10%
+```
+
+**Power state transitions:**
+
+When battery drops below thresholds:
+
+1. Below `normal_threshold`:
+   - Background containers throttled
+   - System containers maintain normal execution
+   - User containers slightly reduced
+
+2. Below `low_threshold`:
+   - Background containers suspended
+   - User containers throttled
+   - System containers maintain execution
+
+3. Below `critical_threshold`:
+   - Only system containers execute
+   - All other containers suspended
+   - System enters low-power mode
+
+### Mobile Connectivity Configuration
+
+**Cellular configuration:**
+
+```toml
+[mobile-connectivity]
+# Cellular radio settings
+cellular_enabled = true
+roaming_allowed = false
+
+# Per-container data limits (MB per day)
+container_data_limit = 100
+```
+
+**Bluetooth configuration:**
+
+```toml
+[mobile-connectivity.bluetooth]
+enabled = true
+discoverable = false
+pairing_required = true
+```
+
+**NFC configuration:**
+
+```toml
+[mobile-connectivity.nfc]
+enabled = true
+secure_element = true
+```
+
+---
+
+## Chapter 12: Maintenance
 
 ### Updates
 
@@ -1467,9 +1872,56 @@ max_channels_per_container = 32
 max_pending_channel_requests = 8
 channel_buffer_default_kb = 64
 
+[signal-coalescence]
+# Enable signal coalescence (if compiled in)
+enabled = true
+
+# Backstop threshold (milliseconds)
+# Process buffered signals after this duration
+backstop_threshold_ms = 5
+
+[resource-pools]
+# Per-class memory pools (if compiled in)
+# Percentages must sum to 100
+system_pool_pct = 40
+user_pool_pct = 50
+background_pool_pct = 10
+
+[core-affinity]
+# Execution context assignment by class (if compiled in)
+# Values must sum to total execution contexts
+system_contexts = 8
+user_contexts = 7
+background_contexts = 1
+
 [security]
 # Require hardware RNG
 hardware_rng_required = true
+
+[power-management]
+# Battery percentage thresholds
+critical_threshold = 5
+low_threshold = 15
+normal_threshold = 30
+
+# Per-class power budgets
+system_budget = 50
+user_budget = 40
+background_budget = 10
+
+[mobile-connectivity]
+cellular_enabled = true
+roaming_allowed = false
+container_data_limit = 100
+
+[mobile-connectivity.bluetooth]
+enabled = true
+discoverable = false
+pairing_required = true
+
+[mobile-connectivity.nfc]
+enabled = true
+secure_element = true
 
 [signature]
 algorithm = "ed25519"
@@ -1493,6 +1945,9 @@ QUICK REFERENCE:
 │  cibos-ctl memory           # Memory usage                 │
 │  cibos-ctl containers       # Container states             │
 │  cibos-ctl channels         # Channel states               │
+│  cibos-ctl signal-coalescence # Signal buffer stats         │
+│  cibos-ctl core-affinity    # Core affinity stats          │
+│  cibos-ctl resource-pools   # Memory pool stats            │
 │                                                             │
 │  Diagnostics:                                               │
 │  cibos-ctl diagnose --container <id>                        │
@@ -1506,6 +1961,13 @@ QUICK REFERENCE:
 │  Build:                                                     │
 │  cargo build --profile <profile>                            │
 │  cargo run --package builder -- --verify-features           │
+│                                                             │
+│  Mobile:                                                    │
+│  cibos-ctl sensor --camera --authorize <id>                │
+│  cibos-ctl sensor --microphone --authorize <id>            │
+│  cibos-ctl sensor --gps --authorize <id> --precision coarse │
+│  cibos-ctl power --status                                   │
+│  cibos-ctl connectivity --status                            │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
