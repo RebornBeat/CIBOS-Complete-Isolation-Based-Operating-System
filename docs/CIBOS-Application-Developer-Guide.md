@@ -949,6 +949,24 @@ PER-LANE WEIGHTS:
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### UI Lane Priority (Compute Profile)
+
+In Compute profile, if interactive monitoring is needed:
+
+```rust
+// High-priority UI lane
+let ui_lane = Lane::create_with_weight(2)?;
+
+// Standard compute lanes
+let compute_lane_1 = Lane::create_with_weight(1)?;
+let compute_lane_2 = Lane::create_with_weight(1)?;
+
+// UI lane selected 2x more often than each compute lane
+// Maintains responsiveness during computation
+```
+
+This is weight-based prioritization, NOT time-based scheduling.
+
 ---
 
 ## Chapter 7: Error Handling
@@ -980,8 +998,8 @@ STALL HANDLING:
 │  │     // This may stall if channel full               │   │
 │  │     channel.send(message).await?;                    │   │
 │  │                                                      │   │
-│  │ // No retry, no polling                             │   │
-│  │ // Kernel will resume when resources available       │   │
+│  │     // No retry, no polling                             │   │
+│  │     // Kernel will resume when resources available       │   │
 │  │ }                                                    │   │
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
@@ -1250,7 +1268,305 @@ The combination of:
 
 ---
 
-## Chapter 11: Application State and Persistence
+## Chapter 11: Event-Driven UI Design
+
+Traditional UI assumes guaranteed frame times (e.g., 60 FPS = 16ms per frame). CIBOS's entropy-based dispatch does not guarantee latency.
+
+### Adapting UI to CIBOS
+
+**Pattern: State Buffering**
+
+Maintain a state buffer that accumulates changes:
+
+1. Input events update state buffer (fast, no rendering)
+2. When UI lane is selected:
+   - Read current state from buffer
+   - Render single frame
+3. State buffer is overwritten, not appended (memory bounded)
+
+**Example:**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                 STATE BUFFER PATTERN                        │
+│                                                             │
+│  UI Container:                                              │
+│                                                             │
+│  State Buffer (memory bounded):                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Element 1: position=(15, 25), color=red            │   │
+│  │ Element 2: position=(100, 200), visible=true       │   │
+│  │ Element 3: text="Hello", font=mono                 │   │
+│  │ ...                                                │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  Event: Mouse move                                         │
+│    → Update state buffer (position: 15, 25 → 17, 27)       │
+│                                                             │
+│  Event: Mouse move                                         │
+│    → Update state buffer (position: 17, 27 → 19, 29)       │
+│                                                             │
+│  [Entropy selects UI lane]                                  │
+│  Event: UI lane runs                                       │
+│    → Read state buffer (latest: 19, 29)                     │
+│    → Render frame                                          │
+│                                                             │
+│  Result: One render for multiple input events              │
+│          Responsive feel from high throughput              │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Memory Costs of UI State Buffering
+
+State buffer memory is bounded by UI complexity:
+
+```
+Per UI element:
+  Position: 2 × f32 = 8 bytes
+  Color: 4 × u8 = 4 bytes
+  Visibility: 1 × bool = 1 byte
+  Other state: ~16 bytes
+  Total per element: ~32 bytes
+
+For 1000 UI elements:
+  State buffer: ~32 KB
+
+Memory cost is acceptable for typical UI complexity.
+```
+
+### Preloading vs Batching
+
+**Preloading:** Loading assets before first use
+- Images, fonts, sounds
+- Reduces latency when assets first needed
+- Separate from batching
+
+**Batching:** Accumulating state changes before rendering
+- Reduces render calls
+- Aligns with entropy-based dispatch
+- Different from preloading
+
+Both are valid optimizations. Neither breaks isolation.
+
+### Weight Classes for UI Responsiveness
+
+In Balanced and Performance profiles, UI containers are system class:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                 UI CLASS ASSIGNMENT                          │
+│                                                             │
+│  I/O Container (system class):                              │
+│    - Receives mouse, keyboard input                         │
+│    - Higher selection probability                           │
+│    → UI container via channel                              │
+│                                                             │
+│  UI Container (system class):                               │
+│    - Receives input from I/O container                      │
+│    - Higher selection probability                           │
+│    - State buffer → render when selected                    │
+│                                                             │
+│  No "hardware class" needed                                 │
+│  System class already provides appropriate priority          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### What NOT to Do
+
+**Do NOT reintroduce time-based scheduling:**
+- No frame time guarantees
+- No priority boosting based on wall-clock time
+- No timer-driven rendering
+
+**Do NOT assume immediate execution:**
+- UI may not run every 16ms
+- Design for throughput, not latency
+- Accumulate state, render when selected
+
+**Do NOT spin or poll:**
+- No polling for "is it time to render"
+- No busy-wait for frame deadlines
+- Use event-driven patterns only
+
+---
+
+## Chapter 12: Sensor Access for Mobile Applications
+
+CIBOS-MOBILE provides complete sensor isolation. Each sensor is an isolated resource requiring per-access authorization.
+
+### Sensor Access Pattern
+
+**Request sensor access:**
+
+```rust
+// Request camera access
+let camera = Sensor::request(SensorType::Camera).await?;
+
+// User sees authorization prompt
+// If approved, camera channel established
+// If denied, error returned
+```
+
+**Use sensor:**
+
+```rust
+// Read camera frame
+let frame = camera.read_frame().await?;
+
+// Process frame
+process_image(frame);
+
+// Camera data never leaves container
+```
+
+**Release sensor:**
+
+```rust
+// Release when done
+camera.release();
+```
+
+### Per-Access Authorization
+
+**Every sensor access requires fresh authorization:**
+
+```
+SENSOR AUTHORIZATION FLOW:
+
+1. Container requests sensor access
+   ↓
+2. Kernel sends authorization request to user
+   ↓
+3. User approves or denies
+   ↓
+4. If approved:
+   - Isolated channel established
+   - Sensor data flows only to requesting container
+   - System indicator shows sensor in use
+   ↓
+5. When container releases sensor:
+   - Channel closed
+   - Sensor no longer accessible
+   - System indicator clears
+```
+
+### Camera Isolation
+
+```
+CAMERA ISOLATION:
+
+┌─────────────────────────────────────────────────────────────┐
+│                    CAMERA ISOLATION                          │
+│                                                             │
+│  Camera is an isolated resource:                            │
+│                                                             │
+│  - Only one container can access at a time                  │
+│  - Per-access authorization required                       │
+│  - Camera data never shared between containers             │
+│  - System indicator when camera active                      │
+│                                                             │
+│  Request:                                                   │
+│    let camera = Sensor::request(SensorType::Camera).await?; │
+│                                                             │
+│  Capture:                                                   │
+│    let frame = camera.read_frame().await?;                  │
+│                                                             │
+│  Release:                                                   │
+│    camera.release();                                        │
+│                                                             │
+│  Multiple requests:                                         │
+│    - Second request blocked until first released           │
+│    - No cross-container observation                        │
+│    - No timing channel from camera access                   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Microphone Isolation
+
+```
+MICROPHONE ISOLATION:
+
+┌─────────────────────────────────────────────────────────────┐
+│                  MICROPHONE ISOLATION                        │
+│                                                             │
+│  Microphone is an isolated resource:                       │
+│                                                             │
+│  - Per-access authorization required                       │
+│  - Recording indicator visible system-wide                 │
+│  - Audio data never shared between containers             │
+│                                                             │
+│  Request:                                                   │
+│    let mic = Sensor::request(SensorType::Microphone).await?;│
+│                                                             │
+│  Record:                                                    │
+│    let audio = mic.read_samples().await?;                  │
+│                                                             │
+│  Release:                                                   │
+│    mic.release();                                           │
+│                                                             │
+│  Recording indicator:                                       │
+│    - Shows in system UI when active                        │
+│    - User can see which container recording                │
+│    - User can revoke access at any time                    │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### GPS Isolation
+
+```
+GPS ISOLATION:
+
+┌─────────────────────────────────────────────────────────────┐
+│                      GPS ISOLATION                           │
+│                                                             │
+│  GPS is an isolated resource:                               │
+│                                                             │
+│  - Per-access authorization required                       │
+│  - Precision level selectable (coarse or fine)             │
+│  - Location data isolated to requesting container          │
+│  - Location history per-container                          │
+│                                                             │
+│  Request (coarse):                                         │
+│    let gps = Sensor::request(SensorType::Gps)              │
+│        .precision(Precision::Coarse)                        │
+│        .await?;                                             │
+│                                                             │
+│  Request (fine):                                            │
+│    let gps = Sensor::request(SensorType::Gps)              │
+│        .precision(Precision::Fine)                          │
+│        .await?;                                             │
+│                                                             │
+│  Read:                                                      │
+│    let location = gps.read_location().await?;               │
+│                                                             │
+│  Precision levels:                                          │
+│    Coarse: ~500m accuracy (privacy-preserving)             │
+│    Fine: ~10m accuracy (requires explicit approval)        │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Other Sensors
+
+All other sensors follow the same isolation pattern:
+
+- Accelerometer
+- Gyroscope
+- Magnetometer
+- Proximity
+- Ambient light
+- Barometer
+- etc.
+
+Each requires per-access authorization and provides complete data isolation.
+
+---
+
+## Chapter 13: Application State and Persistence
 
 ### Your Isolation Boundary
 
@@ -1309,6 +1625,16 @@ When your container restarts (crash or intentional restart), memory state is los
 | `container.memory_usage()` | Current memory usage |
 | `container.memory_limit()` | Memory limit for this container |
 | `container.channel_count()` | Number of active channels |
+
+### Sensor Operations
+
+| Operation | Description |
+|---|---|
+| `Sensor::request(type).await` | Request sensor access (awaits authorization) |
+| `sensor.read_frame().await` | Read camera frame |
+| `sensor.read_samples().await` | Read microphone samples |
+| `sensor.read_location().await` | Read GPS location |
+| `sensor.release()` | Release sensor |
 
 ---
 
