@@ -3,363 +3,205 @@
 
 ## Introduction
 
-This guide provides security analysis methodology for CIBOS systems. It covers threat models, verification procedures, attack surface analysis, and security validation techniques. This guide is intended for security researchers, auditors, and administrators responsible for validating CIBOS deployments.
+This guide provides security analysis methodology for CIBOS systems. It covers threat models, verification procedures, attack surface analysis, and security validation. Intended for security researchers, auditors, and administrators responsible for validating CIBOS deployments.
 
 ---
 
 ## Chapter 1: Threat Model Analysis
 
+### The Security Architecture
+
+CIBOS security is layered. The quantum-like foundation (P, I, N, A) is always present. Security features are ADDITIONS with additional overhead:
+
+```
+LAYERED SECURITY ARCHITECTURE:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     SECURITY FEATURES (Optional Additions)                  │
+│   RTRO  │  Crypto IPC  │  Multi-User  │  User Auth  │  Audit Logging       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                    QUANTUM-LIKE FOUNDATION (Always Present)                  │
+│   No Global Locks  │  Isolation Boundaries  │  Catch and Release            │
+│   Weighted Entropy  │  Lane Architecture  │  Channel Communication          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Foundation provides: isolation, no cascade failures
+Security features add: timing obfuscation, authentication, audit
+```
+
 ### Profile-Based Threat Models
 
-Each CIBOS profile addresses a distinct threat model. Security analysis must consider the appropriate threat model for the deployed profile.
+**Maximum Isolation:**
+- Assumed adversary: Network observer capable of timing analysis, local user attempting to observe other users, sophisticated attacker with system access
+- Protects against: Timing attacks (RTRO + entropy dispatch), inter-user observation (multi-user isolation), behavioral correlation (non-determinism), message forgery (cryptographic IPC), cascade compromise (isolation boundaries), SMT hardware side channels (SMT disabled)
+- Does NOT protect against: Hardware-level attacks (Intel ME, AMD PSP), physical hardware tampering, signing key compromise, hardware timing signals (cache, branch prediction)
 
-```
-THREAT MODEL BY PROFILE:
+**Balanced:**
+- Assumed adversary: Network observer (basic), local user (unprivileged), malware attempting cross-user data access
+- Protects against: Cross-user data access, message forgery, cascade compromise, SMT side channels (disabled by default)
+- Does NOT protect against: Sophisticated timing analysis (RTRO optional), physical attacks
 
-┌─────────────────────────────────────────────────────────────┐
-│                    MAXIMUM ISOLATION                         │
-│                                                             │
-│  ASSUMED ADVERSARY:                                         │
-│  - Network observer capable of timing analysis              │
-│  - Local user attempting to observe other users            │
-│  - Sophisticated attacker with system access               │
-│  - Side-channel attacker analyzing behavioral signals      │
-│                                                             │
-│  WHAT PROFILE PROTECTS AGAINST:                             │
-│  - Timing attacks through RTRO and entropy dispatch        │
-│  - Inter-user observation through isolation               │
-│  - Behavioral correlation through non-determinism          │
-│  - Message forgery through cryptographic IPC               │
-│  - Cascade compromise through isolation boundaries         │
-│  - SMT hardware side channels (SMT disabled)               │
-│                                                             │
-│  WHAT PROFILE DOES NOT PROTECT AGAINST:                    │
-│  - Hardware-level attacks (Intel ME, AMD PSP)              │
-│  - Physical hardware tampering                              │
-│  - Compromise of signing key                               │
-│  - Hardware timing signals (cache, branch prediction)       │
-│                                                             │
-│  RESIDUAL RISKS:                                            │
-│  - Hardware-level surveillance                             │
-│  - Physical access to boot media                           │
-│  - Key compromise                                           │
-│  - Hardware timing signals (unavoidable)                    │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+**Performance:**
+- Assumed adversary: Untrusted software (contained by isolation)
+- Protects against: Cascade compromise, untrusted application accessing system resources
+- Does NOT protect against: Timing attacks (no RTRO), SMT side channels (enabled), physical attacks
 
-┌─────────────────────────────────────────────────────────────┐
-│                      BALANCED                                │
-│                                                             │
-│  ASSUMED ADVERSARY:                                         │
-│  - Network observer (basic)                                 │
-│  - Local user (unprivileged)                               │
-│  - Malware attempting to access other users' data          │
-│                                                             │
-│  WHAT PROFILE PROTECTS AGAINST:                             │
-│  - Cross-user data access                                   │
-│  - Message forgery                                          │
-│  - Cascade compromise                                       │
-│  - SMT hardware side channels (disabled by default)        │
-│                                                             │
-│  WHAT PROFILE DOES NOT PROTECT AGAINST:                    │
-│  - Sophisticated timing analysis (RTRO optional)           │
-│  - Physical attacks                                         │
-│  - Hardware-level attacks                                  │
-│                                                             │
-│  RESIDUAL RISKS:                                            │
-│  - Behavioral analysis if RTRO not enabled                 │
-│  - All hardware-level risks                                │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────┐
-│                     PERFORMANCE                              │
-│                                                             │
-│  ASSUMED ADVERSARY:                                         │
-│  - Untrusted software (contained by isolation)             │
-│                                                             │
-│  WHAT PROFILE PROTECTS AGAINST:                             │
-│  - Cascade compromise                                       │
-│  - Untrusted application accessing system resources        │
-│                                                             │
-│  WHAT PROFILE DOES NOT PROTECT AGAINST:                    │
-│  - Timing attacks (no RTRO)                                │
-│  - Behavioral observation                                   │
-│  - SMT hardware side channels (SMT enabled)                │
-│  - Physical attacks                                         │
-│                                                             │
-│  RESIDUAL RISKS:                                            │
-│  - Observable behavior                                      │
-│  - SMT hardware side channels                              │
-│  - All hardware-level risks                                │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────┐
-│                      COMPUTE                                 │
-│                                                             │
-│  ASSUMED ADVERSARY:                                         │
-│  - None (physical security perimeter)                      │
-│                                                             │
-│  WHAT PROFILE PROTECTS AGAINST:                             │
-│  - Application interference                                 │
-│  - Resource hogging                                         │
-│                                                             │
-│  WHAT PROFILE DOES NOT PROTECT AGAINST:                    │
-│  - Any adversarial observer                                 │
-│  - Physical attacks                                         │
-│  - Network attacks                                          │
-│  - SMT hardware side channels (SMT enabled)                │
-│                                                             │
-│  RESIDUAL RISKS:                                            │
-│  - Physical access to system                                │
-│  - SMT hardware side channels                              │
-│  - All hardware-level risks                                │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+**Compute:**
+- Assumed adversary: None (physical security perimeter)
+- Protects against: Application interference, resource conflicts
+- Does NOT protect against: Any adversarial observer (none expected), physical attacks, network attacks
 
 ---
 
 ## Chapter 2: No-Global-Locks Verification
 
-### Why This Is the Primary Security Verification
-
-Global locks create:
-- Timing side channels from lock contention patterns
-- Observable retry behavior revealing system state
-- Performance bottlenecks that degrade predictably under attack
-- Attack surfaces for timing attacks
-
-Verifying that CIBOS has no global locks is a fundamental security verification for all profiles.
-
-### Verification Methodology
+No global locks is the foundational architectural guarantee that eliminates timing side channels from coordination. Primary security verification for all profiles.
 
 ```
-VERIFICATION METHODOLOGY:
+LOCK vs LOCK-FREE COMPARISON:
 
-┌─────────────────────────────────────────────────────────────┐
-│                  CODE ANALYSIS                               │
-│                                                             │
-│  AUTOMATED SCANS:                                           │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # Search for lock primitives                         │   │
-│  │ grep -r "Mutex\|RwLock\|spin_lock\|atomic_lock" src/│   │
-│  │                                                      │   │
-│  │ # Should return nothing                             │   │
-│  │ # If results found: FAILURE                         │   │
-│  │                                                      │   │
-│  │ # Check for lock-related patterns                   │   │
-│  │ grep -r "\.lock()\|\.read()\|\.write()\|try_lock" src/│   │
-│  │                                                      │   │
-│  │ # Verify message-passing is the only inter-thread   │   │
-│  │ grep -r "Arc<\|Rc<" src/                            │   │
-│  │ # Should only appear for message channel endpoints  │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  MANUAL REVIEW:                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ For each data structure:                             │   │
-│  │                                                      │   │
-│  │ 1. Who owns this?                                   │   │
-│  │    - If shared ownership: INVESTIGATE               │   │
-│  │    - If single owner: PASS                          │   │
-│  │                                                      │   │
-│  │ 2. Who reads?                                        │   │
-│  │    - If multiple readers: INVESTIGATE               │   │
-│  │    - If single reader: PASS                         │   │
-│  │                                                      │   │
-│  │ 3. Who writes?                                       │   │
-│  │    - If multiple writers: FAILURE                   │   │
-│  │    - If single writer: PASS                         │   │
-│  │                                                      │   │
-│  │ 4. Is synchronization needed?                       │   │
-│  │    - If yes: INVESTIGATE                            │   │
-│  │    - If no: PASS                                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  DOCUMENTED OWNERSHIP:                                      │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ - Ready Pool: Owned exclusively by selector thread   │   │
-│  │ - Stalled List: Owned exclusively by selector thread │   │
-│  │ - Resource registry: Owned exclusively by selector   │   │
-│  │ - Core state: Owned exclusively by selector         │   │
-│  │ - Per-core execution state: Owned by each core      │   │
-│  │ - Message channels: SPSC (no locks needed)          │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+TRADITIONAL OS WITH LOCKS:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Thread A ────┐                                                             │
+│  Thread B ────┼───► LOCK ───► Shared Data                                  │
+│  Thread C ────┘        │                                                   │
+│                         ▼                                                   │
+│                    ┌─────────┐                                              │
+│                    │ THREAD  │                                              │
+│                    │ WAITS   │                                              │
+│                    │ (queue) │ ← Observable timing signals                  │
+│                    └─────────┘                                              │
+│  Observable: lock timing, wait duration, queue position, holder duration   │
+│  Timing side channels: MANY                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+CIBOS (NO LOCKS):
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Lane A ────┐                                                               │
+│  Lane B ────┼───► READY POOL ───► DISPATCH                                 │
+│  Lane C ────┘      (single owner)                                           │
+│                         ▼                                                   │
+│                    ┌─────────┐                                              │
+│                    │   NO    │                                              │
+│                    │WAITING  │                                              │
+│                    │  NO     │                                              │
+│                    │ QUEUE   │                                              │
+│                    └─────────┘                                              │
+│  Observable: entry to Ready Pool (no timing significance), dispatch         │
+│  Timing side channels: NONE from coordination                               │
+│                                                                             │
+│  THE DIFFERENCE:                                                            │
+│  Locks CREATE coordination → CREATE observable signals                      │
+│  No locks REMOVE coordination → REMOVE observable signals                   │
+│  You cannot "secure" locks. You can only remove them.                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Code Analysis
+
+```bash
+# Search for lock primitives — should find nothing
+grep -r "Mutex\|RwLock\|spin_lock\|atomic_lock" src/
+
+# Check for lock-related patterns
+grep -r "\.lock()\|\.read()\|\.write()\|try_lock" src/
+
+# Verify message-passing is the only inter-thread mechanism
+grep -r "Arc<\|Rc<" src/
+# Should only appear for message channel endpoints
+
+# Check async runtime — should find NO Tokio dependency
+grep -r "tokio::" src/
+# Should find nothing in kernel or async-runtime
+```
+
+### Ownership Audit
+
+Verify single ownership for every mutable data structure:
+
+| Data Structure | Owner | Verification |
+|---|---|---|
+| Ready Pool | Selector | Single-owner verified |
+| Stalled List | Selector | Single-owner verified |
+| Resource registry | Selector | Single-owner verified |
+| Core state | Selector | Single-owner verified |
+| All weight data | Selector | Single-owner verified |
+| Class pool metadata | Selector | Single-owner (when compiled) |
+| Core affinity mapping | Selector | Single-owner (when compiled) |
+| Per-lane task queue | Each LaneExecutor | Lane-local, single-owner |
+| Per-core execution state | Each context | During execution |
+
+### Dispatch Correctness Verification
+
+```bash
+cibos-test --verify-dispatch-model
+
+# Expected output:
+#   No-competition dispatches: 1,112,456
+#   Competition dispatches: 133,376
+#   PASS: All ready events dispatched when no competition (N ≤ C)
+#   PASS: Exactly C dispatched when competition (N > C)
+#   PASS: Weighted entropy used ONLY when competition exists
+#
+# If no-competition dispatch dispatches fewer than all ready events:
+#   → CRITICAL FAILURE
+```
+
+### Async Runtime Lock Verification
+
+```bash
+cibos-test --verify-async-no-locks
+
+# Verify:
+# - LaneExecutor: lane-local queue, single owner
+# - CibosWaker: signals kernel via message, no locks
+# - No global task queue anywhere
+# - No Tokio/async-std runtime dependency
 ```
 
 ### Runtime Verification
 
-```
-RUNTIME ANALYSIS:
-
-┌─────────────────────────────────────────────────────────────┐
-│                   RUNTIME ANALYSIS                           │
-│                                                             │
-│  THREAD SANITIZER TEST:                                     │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # Build with thread sanitizer                        │   │
-│  │ RUSTFLAGS="-Z sanitizer=thread" cargo build         │   │
-│  │                                                      │   │
-│  │ # Run under load                                     │   │
-│  │ cibos-test --load high                               │   │
-│  │                                                      │   │
-│  │ # Look for:                                          │   │
-│  │ # - Data races                                      │   │
-│  │ # - Lock violations                                  │   │
-│  │ # - Deadlocks                                        │   │
-│  │ #                                                    │   │
-│  │ # If any detected: FAILURE                          │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  CONTENTION TESTING:                                        │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # Create high contention                             │   │
-│  │ cibos-test --containers 1000 --lanes-per 10        │   │
-│  │                                                      │   │
-│  │ # Monitor:                                           │   │
-│  │ # - Selection latency distribution                  │   │
-│  │ # - Throughput under load                            │   │
-│  │ # - Core utilization                                 │   │
-│  │                                                      │   │
-│  │ # Look for:                                          │   │
-│  │ # - Super-linear latency growth                     │   │
-│  │ # - Periodic spikes                                  │   │
-│  │ # - Core serialization                               │   │
-│  │ #                                                    │   │
-│  │ # Linear latency growth: PASS                        │   │
-│  │ # Super-linear growth: FAILURE                       │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Dispatch Correctness Verification
-
-A critical correctness property: when N events are ready and N ≤ C execution contexts are available, ALL N events should dispatch simultaneously. When competition exists, exactly C events should be dispatched (where C = available contexts).
-
-```
-DISPATCH CORRECTNESS:
-
-┌─────────────────────────────────────────────────────────────┐
-│               DISPATCH MODEL VERIFICATION                    │
-│                                                             │
-│  CRITICAL PROPERTIES:                                       │
-│                                                             │
-│  PROPERTY 1: NO-COMPETITION DISPATCH                       │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ When ready_count ≤ available_contexts:              │   │
-│  │   ALL ready events dispatch simultaneously         │   │
-│  │   Weighted entropy is NOT used                     │   │
-│  │                                                      │   │
-│  │ This is a correctness property, not just            │   │
-│  │ performance optimization                            │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  PROPERTY 2: COMPETITION DISPATCH                          │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ When ready_count > available_contexts:              │   │
-│  │   Exactly available_contexts events dispatch        │   │
-│  │   Weighted entropy is used for selection           │   │
-│  │   Remaining events stay in Ready Pool              │   │
-│  │                                                      │   │
-│  │ This ensures the dispatch model is correct         │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  VERIFICATION COMMAND:                                      │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ cibos-test --verify-dispatch-model                  │   │
-│  │                                                      │   │
-│  │ Expected output:                                    │   │
-│  │   No-competition dispatches: 1,112,456             │   │
-│  │   Competition dispatches: 133,376                   │   │
-│  │   Average ready events when no competition: 2.1     │   │
-│  │   Average dispatched when competition: 4.0         │   │
-│  │   PASS: All ready events dispatched when no        │   │
-│  │         competition                                 │   │
-│  │                                                      │   │
-│  │ If any no-competition dispatch dispatched fewer     │   │
-│  │ than all ready events: CRITICAL FAILURE             │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Signal Coalescence Security Verification
-
-Signal coalescence does NOT reintroduce timing side channels:
-
-**Verification:**
-
 ```bash
-cibos-test --signal-coalescence-security
+# Thread sanitizer
+RUSTFLAGS="-Z sanitizer=thread" cargo build
+cibos-test --load high
+# Any data race = FAILURE
 
-Tests:
-  1. Signal processing time distribution
-  2. Batch size correlation with container behavior
-  3. Timing pattern observability
+# Contention test
+cibos-test --containers 1000 --lanes-per 10
+# Linear latency growth = PASS
+# Super-linear growth = FAILURE
 
-Expected:
-  - No correlation between batch size and container activity
-  - No observable timing patterns from coalescence
-  - Processing time independent of which containers benefit
-```
-
-**Key invariant:** Signal coalescence processes inputs faster, but does not reveal which containers were waiting for those signals.
-
-### Signal Threshold Security Verification
-
-The signal-coalescence-threshold does NOT create a dispatch timing channel:
-
-**Verification:**
-
-```bash
-cibos-test --signal-threshold-security
-
-Tests:
-  1. Threshold affects signal processing, not dispatch
-  2. No observable dispatch timing correlation with threshold fires
-  3. Container selection independent of signal buffer age
-
-Expected:
-  - Threshold only affects when signals are processed
-  - Dispatch remains entropy-based
-  - No correlation between threshold and container selection
+# No polling verification
+cibos-test --verify-no-polling
+# Should find zero polling loops
 ```
 
 ### Verification Checklist
 
 ```
-VERIFICATION CHECKLIST:
+NO-GLOBAL-LOCKS CHECKLIST:
 
-┌─────────────────────────────────────────────────────────────┐
-│                    CHECKLIST                                 │
-│                                                             │
-│  □ No Mutex<T> in kernel codebase                           │
-│  □ No RwLock<T> in kernel codebase                          │
-│  □ No spin locks in kernel codebase                         │
-│  □ No atomic operations used for locking                    │
-│  □ Ready Pool has single owner (selector)                   │
-│  □ Stalled List has single owner (selector)                 │
-│  □ Selector thread exclusive ownership verified             │
-│  □ Cores do not access shared pools                         │
-│  □ All inter-thread communication via messages             │
-│  □ No polling loops                                         │
-│  □ No busy-wait loops                                       │
-│  □ Thread sanitizer passes                                  │
-│  □ Contention test shows linear scaling                    │
-│  □ No periodic latency spikes                               │
-│  □ Dispatch model: all ready events dispatch when           │
-│    no competition                                           │
-│  □ Dispatch model: weighted entropy used only when          │
-│    competition exists                                       │
-│                                                             │
-│  ALL CHECKS MUST PASS FOR VERIFICATION SUCCESS             │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+□ No Mutex<T> in kernel codebase
+□ No RwLock<T> in kernel codebase
+□ No spin locks in kernel codebase
+□ No Tokio dependency in kernel or async-runtime
+□ No global task queue anywhere
+□ All mutable state has single owner
+□ Ready Pool: single owner (selector) verified
+□ Stalled List: single owner (selector) verified
+□ All weight data: single owner (selector) verified
+□ Dynamic weight updates: message passing verified (when compiled)
+□ LaneExecutor: lane-local, single owner
+□ CibosWaker: signals via message, no locks
+□ All inter-thread communication via SPSC queues
+□ No busy-wait loops
+□ No polling loops
+□ No retry loops (all waits event-driven)
+□ Thread sanitizer passes
+□ Contention test shows linear scaling
+□ Dispatch model: all ready dispatch when no competition
+□ Dispatch model: entropy only when competition exists
 ```
 
 ---
@@ -368,249 +210,92 @@ VERIFICATION CHECKLIST:
 
 ### What Isolation Boundaries Must Guarantee
 
-```
-ISOLATION REQUIREMENTS:
-
-┌─────────────────────────────────────────────────────────────┐
-│                 ISOLATION REQUIREMENTS                       │
-│                                                             │
-│  MEMORY ISOLATION:                                          │
-│  - Container A cannot read Container B's memory            │
-│  - Container A cannot write Container B's memory           │
-│  - Container A cannot execute Container B's code           │
-│  - Kernel memory inaccessible to containers                │
-│                                                             │
-│  RESOURCE ISOLATION:                                        │
-│  - Container A cannot access Container B's files          │
-│  - Container A cannot access Container B's channels       │
-│  - Container A cannot access Container B's I/O            │
-│                                                             │
-│  LANE ISOLATION:                                            │
-│  - Lane 1 cannot access Lane 2's memory within container  │
-│  - Each lane's memory region is private                    │
-│                                                             │
-│  COMMUNICATION ISOLATION:                                   │
-│  - Containers can only communicate through channels        │
-│  - Channels require mutual acceptance                      │
-│  - No shared memory communication                          │
-│  - No signal-based communication                           │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+- Container A cannot read/write/execute Container B's memory
+- Container A cannot access Container B's files, channels, or I/O
+- Lane 1 cannot access Lane 2's memory within same container
+- Kernel memory is inaccessible to containers
+- No shared memory between containers or lanes
 
 ### Verification Tests
 
-```
-ISOLATION TESTS:
+```bash
+# Memory isolation
+cibos-test --isolation memory-read
+cibos-test --isolation memory-write
+# Expected: ACCESS DENIED
+# If ACCESS GRANTED → CRITICAL FAILURE
 
-┌─────────────────────────────────────────────────────────────┐
-│                    ISOLATION TESTS                           │
-│                                                             │
-│  TEST 1: MEMORY ACCESS                                     │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # Container A attempts to read B's memory           │   │
-│  │ cibos-test --isolation memory-read                  │   │
-│  │                                                      │   │
-│  │ # Expected: ACCESS DENIED                           │   │
-│  │ # Actual: ACCESS DENIED                             │   │
-│  │ # Result: PASS                                       │   │
-│  │                                                      │   │
-│  │ # If ACCESS GRANTED: CRITICAL FAILURE               │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  TEST 2: FILE SYSTEM ISOLATION                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # Container A attempts to open B's files             │   │
-│  │ cibos-test --isolation file-access                  │   │
-│  │                                                      │   │
-│  │ # Expected: ACCESS DENIED                           │   │
-│  │ # Result: PASS if ACCESS DENIED                     │   │
-│  │ # CRITICAL FAILURE if ACCESS GRANTED                │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  TEST 3: CHANNEL ISOLATION                                 │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # Container A attempts to send on B's channel        │   │
-│  │ cibos-test --isolation channel-access               │   │
-│  │                                                      │   │
-│  │ # Expected: ACCESS DENIED                           │   │
-│  │ # Result: PASS if ACCESS DENIED                     │   │
-│  │ # CRITICAL FAILURE if ACCESS GRANTED                │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  TEST 4: LANE ISOLATION                                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # Lane 1 attempts to access Lane 2's memory         │   │
-│  │ cibos-test --isolation lane-access                  │   │
-│  │                                                      │   │
-│  │ # Expected: ACCESS DENIED                           │   │
-│  │ # Result: PASS if ACCESS DENIED                     │   │
-│  │ # CRITICAL FAILURE if ACCESS GRANTED                │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  TEST 5: CONTAINER ENUMERATION                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # Container A attempts to discover all containers   │   │
-│  │ cibos-test --isolation container-discovery          │   │
-│  │                                                      │   │
-│  │ # Expected: No containers discovered                │   │
-│  │ # Result: PASS if discovery failed                 │   │
-│  │ # FAILURE if containers found without channels      │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+# File system isolation
+cibos-test --isolation file-access
+# Expected: ACCESS DENIED
+
+# Channel isolation (sender hijacking)
+cibos-test --isolation channel-access
+# Expected: Message rejected — wrong sender
+
+# Lane isolation within container
+cibos-test --isolation lane-access
+# Expected: ACCESS DENIED
+
+# Container enumeration prevention
+cibos-test --isolation container-discovery
+# Expected: No containers discovered without prior channel establishment
+
+# Async runtime isolation
+cibos-test --isolation async-runtime
+# Expected: Lane queue inaccessible to other lanes/containers
 ```
 
-### Class Resource Pool Isolation
+### Dynamic Weights — No New Attack Surface
 
-When `class-resource-pools` is enabled:
+Dynamic weight updates (Compute profile) do not introduce new isolation violations:
+- Container sends message to selector (no shared state)
+- Selector updates weight (single owner)
+- No container can update another container's weights (message authenticated by channel)
+- Container enumeration still not possible (weight update requires knowing lane ID)
+
+```bash
+cibos-test --isolation dynamic-weight-cross-container
+# Expected: Weight update rejected for non-owned lanes
+```
+
+### Class Resource Pool Isolation (When Compiled)
 
 ```bash
 cibos-test --isolation class-pools
 
-Tests:
-  1. System container cannot exhaust user pool
-  2. User container cannot exhaust system pool
-  3. Background container cannot exhaust any other pool
-  4. Pool exhaustion only affects same-class containers
-
-Expected:
-  - Cross-class isolation maintained
-  - No cross-pool borrowing
-  - Class boundaries enforced
-```
-
-### Core Affinity Isolation
-
-When `class-core-affinity` is enabled:
-
-```bash
-cibos-test --isolation core-affinity
-
-Tests:
-  1. System event never dispatched to user context
-  2. User event never dispatched to system context
-  3. Affinity routing is deterministic by class
-  4. No cross-pool dispatch occurs
-
-Expected:
-  - Class-context boundaries enforced
-  - Routing is deterministic (class is not secret)
-  - No side channel from routing
-```
-
-### Sensor Isolation Verification
-
-When `sensor-subsystem` is enabled:
-
-```bash
-cibos-test --isolation sensors
-
-Tests:
-  1. Container A cannot observe Container B's sensor access
-  2. Sensor data never crosses container boundaries
-  3. Authorization required for each access
-  4. System indicators accurate when sensors active
-  5. Revocation immediately blocks access
-
-Expected:
-  - Complete sensor isolation
-  - No cross-container observation
-  - Per-access authorization enforced
+# Verify:
+# System container cannot exhaust user pool
+# User container cannot exhaust system pool
+# Background cannot exhaust any other pool
+# Cross-class isolation maintained
 ```
 
 ---
 
 ## Chapter 4: Configuration Security
 
-### Configuration Attack Vectors
+### Attack Vectors
 
-```
-CONFIGURATION ATTACKS:
+| Attack | Protection | Verification |
+|---|---|---|
+| Config modification | Signature verification | `cibos-test --config modified.conf` → rejected |
+| Config substitution | Signature verification | `cibos-test --config substituted.conf` → rejected |
+| Key compromise | Key management procedures | Physical key security audit |
+| Unsigned config | Falls back to compiled defaults | `cibos-test --config unsigned.conf` → defaults applied |
 
-┌─────────────────────────────────────────────────────────────┐
-│                  ATTACK VECTORS                              │
-│                                                             │
-│  ATTACK 1: MODIFICATION                                     │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Adversary modifies cibos.conf                        │   │
-│  │ Goal: Change weights to favor adversary's containers│   │
-│  │                                                      │   │
-│  │ Mitigation: Signature verification                  │   │
-│  │ Attack result: Signature invalid, config rejected   │   │
-│  │ System: Uses compiled defaults                       │   │
-│  │                                                      │   │
-│  │ Verification:                                        │   │
-│  │ cibos-test --config modified.conf                   │   │
-│  │ Expected: Config rejected                           │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ATTACK 2: SUBSTITUTION                                     │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Adversary substitutes entire config file            │   │
-│  │ Goal: Replace with adversarial configuration        │   │
-│  │                                                      │   │
-│  │ Mitigation: Signature verification                  │   │
-│  │ Attack result: Signature invalid, config rejected   │   │
-│  │                                                      │   │
-│  │ Verification:                                        │   │
-│  │ cibos-test --config substituted.conf                │   │
-│  │ Expected: Config rejected                           │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ATTACK 3: KEY COMPROMISE                                   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Adversary obtains signing key                        │   │
-│  │ Goal: Create valid signed adversarial config        │   │
-│  │                                                      │   │
-│  │ Mitigation: Key management procedures               │   │
-│  │ Attack result: Valid config accepted                │   │
-│  │                                                      │   │
-│  │ This is a KEY MANAGEMENT failure, not system failure│   │
-│  │ System behaves correctly (accepts valid config)      │   │
-│  │                                                      │   │
-│  │ Verification:                                        │   │
-│  │ Key storage audit                                   │   │
-│  │ Key access audit                                    │   │
-│  │ Key rotation verification                           │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+### Verification
 
-### Configuration Verification
+```bash
+# Verify signature
+cibos-verify --config cibos.conf --sig cibos.sig --key pub.pem
 
-```
-CONFIG VERIFICATION:
+# Verify boot acceptance
+cibos-test --boot-test
 
-┌─────────────────────────────────────────────────────────────┐
-│                CONFIG VERIFICATION                           │
-│                                                             │
-│  VERIFICATION PROCEDURE:                                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ 1. Verify config file exists                        │   │
-│  │    ls -la /boot/cibos.conf                         │   │
-│  │                                                      │   │
-│  │ 2. Verify signature exists                          │   │
-│  │    ls -la /boot/cibos.sig                          │   │
-│  │                                                      │   │
-│  │ 3. Verify signature                                 │   │
-│  │    cibos-verify --config cibos.conf --sig cibos.sig│   │
-│  │                                                      │   │
-│  │ 4. Verify config values                             │   │
-│  │    cibos-check --config cibos.conf                 │   │
-│  │                                                      │   │
-│  │ 5. Verify boot acceptance                           │   │
-│  │    cibos-test --boot-test                           │   │
-│  │                                                      │   │
-│  │ 6. Verify unsigned config fallback                  │   │
-│  │    cibos-test --config unsigned.conf                │   │
-│  │    Expected: Compiled defaults applied              │   │
-│  │                                                      │   │
-│  │ ALL MUST PASS                                       │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+# Verify unsigned config fallback (system must remain operational)
+cibos-test --config unsigned.conf
+# Expected: Compiled defaults applied, system operational
 ```
 
 ---
@@ -619,561 +304,217 @@ CONFIG VERIFICATION:
 
 ### Channel Threat Model
 
-```
-CHANNEL THREATS:
+| Threat | System Behavior | Verification |
+|---|---|---|
+| Unauthorized channel request | Receiver must accept; if rejected, no channel | `cibos-test --channel unauthorized-request` |
+| Sender hijacking | Kernel verifies sender identity; wrong sender → rejected | `cibos-test --channel sender-hijack` |
+| Message injection | Isolation boundaries prevent external injection | `cibos-test --channel message-injection` |
+| Channel enumeration | No enumeration API; containers know only own channels | `cibos-test --channel enumeration` |
+| Rate limit bypass | Kernel enforces unconditionally; sender stalls | `cibos-test --channel rate-limit-bypass` |
 
-┌─────────────────────────────────────────────────────────────┐
-│                   CHANNEL THREATS                            │
-│                                                             │
-│  THREAT 1: UNAUTHORIZED CHANNEL                            │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Container A attempts channel to B without B's consent│   │
-│  │                                                      │   │
-│  │ System behavior:                                    │   │
-│  │ - A requests channel                                │   │
-│  │ - Kernel delivers request to B                      │   │
-│  │ - B rejects                                         │   │
-│  │ - No channel created                                │   │
-│  │                                                      │   │
-│  │ Result: ATTACK FAILED                               │   │
-│  │                                                      │   │
-│  │ Verification:                                        │   │
-│  │ cibos-test --channel unauthorized-request           │   │
-│  │ Expected: Request rejected, no channel created      │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  THREAT 2: CHANNEL HIJACKING                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Container C attempts to send on A→B channel         │   │
-│  │                                                      │   │
-│  │ System behavior:                                    │   │
-│  │ - Kernel checks sender identity                     │   │
-│  │ - Sender is C, not A                               │   │
-│  │ - Message rejected                                 │   │
-│  │                                                      │   │
-│  │ Result: ATTACK FAILED                               │   │
-│  │                                                      │   │
-│  │ Verification:                                        │   │
-│  │ cibos-test --channel sender-hijack                  │   │
-│  │ Expected: Message rejected                          │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  THREAT 3: MESSAGE INJECTION                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Adversary injects message into channel              │   │
-│  │                                                      │   │
-│  │ System behavior:                                    │   │
-│  │ - Kernel enforces channel boundaries                │   │
-│  │ - No access to channel internals                    │   │
-│  │ - Injection not possible                            │   │
-│  │                                                      │   │
-│  │ Result: ATTACK FAILED                               │   │
-│  │                                                      │   │
-│  │ Verification:                                        │   │
-│  │ cibos-test --channel message-injection              │   │
-│  │ Expected: No injection path exists                  │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  THREAT 4: CHANNEL ENUMERATION                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Container A attempts to discover all channels        │   │
-│  │                                                      │   │
-│  │ System behavior:                                    │   │
-│  │ - No enumeration API                                │   │
-│  │ - Containers only know their own channels           │   │
-│  │ - Discovery not possible                            │   │
-│  │                                                      │   │
-│  │ Result: ATTACK FAILED                               │   │
-│  │                                                      │   │
-│  │ Verification:                                        │   │
-│  │ cibos-test --channel enumeration                    │   │
-│  │ Expected: No channels discovered                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  THREAT 5: RATE LIMIT BYPASS                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Container A attempts to exceed rate limit            │   │
-│  │                                                      │   │
-│  │ System behavior:                                    │   │
-│  │ - Kernel enforces rate limits unconditionally       │   │
-│  │ - Sender stalls when limit exceeded                 │   │
-│  │                                                      │   │
-│  │ Result: ATTACK FAILED                               │   │
-│  │                                                      │   │
-│  │ Verification:                                        │   │
-│  │ cibos-test --channel rate-limit-bypass              │   │
-│  │ Expected: Sender stalls when limit exceeded         │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Channel Security Tests
-
-```
-CHANNEL TESTS:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    CHANNEL TESTS                             │
-│                                                             │
-│  TEST 1: UNAUTHORIZED REQUEST                              │
-│  cibos-test --channel unauthorized-request                 │
-│  Expected: Request rejected                                │
-│  Pass: Request rejected                                    │
-│                                                             │
-│  TEST 2: SENDER HIJACKING                                  │
-│  cibos-test --channel sender-hijack                         │
-│  Expected: Message rejected                                │
-│  Pass: Message rejected                                    │
-│                                                             │
-│  TEST 3: MESSAGE INJECTION                                 │
-│  cibos-test --channel message-injection                     │
-│  Expected: No injection possible                           │
-│  Pass: Injection failed                                    │
-│                                                             │
-│  TEST 4: CHANNEL ENUMERATION                               │
-│  cibos-test --channel enumeration                          │
-│  Expected: No enumeration possible                         │
-│  Pass: Enumeration failed                                  │
-│                                                             │
-│  TEST 5: RATE LIMIT ENFORCEMENT                            │
-│  cibos-test --channel rate-limit                           │
-│  Expected: Sender stalls when limit exceeded               │
-│  Pass: Stall occurred                                      │
-│                                                             │
-│  ALL TESTS MUST PASS                                       │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+All tests: Expected result is protection holds. Any failure = security violation.
 
 ---
 
-## Chapter 6: RTRO Effectiveness Analysis (Maximum Isolation and Balanced)
+## Chapter 6: RTRO Effectiveness Analysis
 
-### What RTRO Should Prevent
+### What RTRO Should Accomplish
 
-```
-RTRO EFFECTIVENESS:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    RTRO GOALS                                │
-│                                                             │
-│  SHOULD OBSCURE:                                            │
-│  - CPU usage per container                                  │
-│  - Memory usage per container                               │
-│  - Event timing patterns                                    │
-│  - Container activity correlation                           │
-│                                                             │
-│  SHOULD NOT AFFECT:                                         │
-│  - Actual execution                                         │
-│  - Execution ordering                                       │
-│  - Application behavior                                     │
-│  - System throughput                                        │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+- Obfuscate CPU usage per container in system interfaces
+- Obfuscate memory usage per container in system interfaces
+- Obfuscate event timing patterns at kernel boundary
+- NOT affect actual execution — dispatch decisions use real state
+- NOT add artificial delays
 
 ### RTRO Verification
 
-```
-RTRO VERIFICATION:
+```bash
+# CPU usage obfuscation
+cibos-test --rtro cpu-observation
+# Run same workload multiple times, compare reported CPU usage
+# Expected: Different values each run, no correlation with actual
 
-┌─────────────────────────────────────────────────────────────┐
-│                   RTRO VERIFICATION                          │
-│                                                             │
-│  TEST 1: CPU USAGE OBSERVATION                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # Measure CPU usage reports                         │   │
-│  │ cibos-test --rtro cpu-observation                   │   │
-│  │                                                      │   │
-│  │ # Run same workload multiple times                  │   │
-│  │ # Compare reported CPU usage                         │   │
-│  │                                                      │   │
-│  │ Expected: Different values each run                 │   │
-│  │ Pass: Values randomized                             │   │
-│  │ Fail: Identical values                              │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  TEST 2: TIMING ANALYSIS                                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # Attempt to correlate timing                       │   │
-│  │ cibos-test --rtro timing-analysis                   │   │
-│  │                                                      │   │
-│  │ # Run container with known pattern                  │   │
-│  │ # Attempt to detect pattern in system behavior       │   │
-│  │                                                      │   │
-│  │ Expected: No detectable pattern                     │   │
-│  │ Pass: Pattern not detected                          │   │
-│  │ Fail: Pattern detected                              │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  TEST 3: THROUGHPUT IMPACT                                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ # Measure throughput with RTRO on vs off            │   │
-│  │ cibos-test --rtro throughput                        │   │
-│  │                                                      │   │
-│  │ # Compare throughput                                │   │
-│  │                                                      │   │
-│  │ Expected: Minimal difference                        │   │
-│  │ Pass: < 5% difference                               │   │
-│  │ Fail: > 5% difference                               │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+# Timing analysis resistance
+cibos-test --rtro timing-analysis
+# Run container with known pattern, attempt to detect in system behavior
+# Expected: Pattern not detectable
+
+# Throughput impact
+cibos-test --rtro throughput
+# Compare throughput with RTRO on vs off
+# Expected: < 5% difference
 ```
 
 ---
 
 ## Chapter 7: SMT Security Analysis
 
-### SMT Side Channels by Profile
+| Profile | SMT | Security Reason | Verification |
+|---|---|---|---|
+| Maximum Isolation | Disabled | Eliminate hardware side-channels entirely | `cibos-ctl hardware --smt-status` → Disabled |
+| Balanced | Disabled (default) | Security-conscious default | Same |
+| Performance | Enabled | Acceptable: no adversary | Same → Enabled |
+| Compute | Enabled | Air-gapped, no adversary | Same → Enabled |
 
-```
-SMT SECURITY ANALYSIS:
+**Why SMT doesn't create software bottlenecks in CIBOS:** Traditional SMT creates thread contention, cache thrashing from shared state, and time-slice serialization. CIBOS with SMT has none of these — no locks means no contention; isolated memory means no shared state interference; event-driven dispatch means no time-slicing. Only hardware-level cache sharing between logical cores on one physical core remains, which is why security-conscious profiles disable SMT.
 
-┌─────────────────────────────────────────────────────────────┐
-│                   SMT BY PROFILE                             │
-│                                                             │
-│  MAXIMUM ISOLATION — SMT DISABLED:                          │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Hardware side channels through SMT are ELIMINATED   │   │
-│  │                                                      │   │
-│  │ - Each physical core runs exactly one lane          │   │
-│  │ - No cache sharing between simultaneous executions  │   │
-│  │ - No branch predictor contamination                │   │
-│  │                                                      │   │
-│  │ Verification:                                        │   │
-│  │ cibos-ctl hardware --smt-status                     │   │
-│  │ Expected: SMT Disabled                              │   │
-│  │ Available contexts = Physical core count            │   │
-│  │                                                      │   │
-│  │ Risk: NONE (SMT disabled)                           │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  BALANCED — SMT DISABLED BY DEFAULT:                        │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Same security as Maximum Isolation by default        │   │
-│  │                                                      │   │
-│  │ If user enables SMT:                                │   │
-│  │   - Side channels introduced                        │   │
-│  │   - Trade-off documented explicitly                 │   │
-│  │                                                      │   │
-│  │ Verification:                                        │   │
-│  │ cibos-ctl hardware --smt-status                     │   │
-│  │ Expected: SMT Disabled (unless explicitly enabled)  │   │
-│  │                                                      │   │
-│  │ Risk: None by default; user-choice documented       │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  PERFORMANCE — SMT ENABLED:                                 │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Hardware-level side channels present:               │   │
-│  │ - L1/L2 cache sharing between logical cores        │   │
-│  │ - Branch predictor sharing                         │   │
-│  │ - Execution unit sharing                           │   │
-│  │                                                      │   │
-│  │ Acceptable because:                                 │   │
-│  │ - No adversarial observer in threat model           │   │
-│  │ - Physical security perimeter                       │   │
-│  │                                                      │   │
-│  │ Verification:                                        │   │
-│  │ cibos-ctl hardware --smt-status                     │   │
-│  │ Expected: SMT Enabled                              │   │
-│  │                                                      │   │
-│  │ Risk: Hardware side channels (acceptable per        │   │
-│  │       threat model)                                 │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  COMPUTE — SMT ENABLED:                                     │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Hardware-level side channels present:               │   │
-│  │ - L1/L2 cache sharing between logical cores        │   │
-│  │ - Branch predictor sharing                         │   │
-│  │ - Execution unit sharing                           │   │
-│  │                                                      │   │
-│  │ Acceptable because:                                 │   │
-│  │ - Air-gapped environment                            │   │
-│  │ - No adversarial observer                          │   │
-│  │ - Physical security perimeter                       │   │
-│  │                                                      │   │
-│  │ Verification:                                        │   │
-│  │ cibos-ctl hardware --smt-status                     │   │
-│  │ Expected: SMT Enabled                              │   │
-│  │                                                      │   │
-│  │ Risk: Hardware side channels (acceptable per        │   │
-│  │       threat model)                                 │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+---
+
+## Chapter 8: Feature-Specific Security Verification
+
+### Dynamic Weights (Compute Profile)
+
+```bash
+# Verify cross-container isolation maintained
+cibos-test --security dynamic-weights-isolation
+# Expected: Weight update rejected for non-owned lanes
+
+# Verify weight update messages cannot be forged
+cibos-test --security dynamic-weights-auth
+# Expected: Forged weight update rejected
+
+# Verify observable patterns are acceptable for Compute threat model
+# Note: Observable timing IS acceptable for Compute (no adversary)
+cibos-test --security dynamic-weights-timing --profile compute
+# Expected: Timing observable (documented — acceptable for Compute)
 ```
 
-### Why SMT Doesn't Create Software Bottlenecks
+### Async Runtime Security (All Profiles)
 
+```bash
+# Verify async runtime uses no global locks
+cibos-test --security async-runtime-no-locks
+
+# Verify .await stall/resume via kernel (not polling)
+cibos-test --security async-await-kernel-delegate
+
+# Verify lane queues are isolated from each other
+cibos-test --security lane-queue-isolation
 ```
-SMT IN CIBOS vs TRADITIONAL SYSTEMS:
 
-┌─────────────────────────────────────────────────────────────┐
-│           WHY SMT IS DIFFERENT IN CIBOS                      │
-│                                                             │
-│  TRADITIONAL SYSTEMS WITH SMT:                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Problems:                                            │   │
-│  │ - Thread contention for locks                        │   │
-│  │ - Cache thrashing from shared state                  │   │
-│  │ - Time-slice serialization                           │   │
-│  │ - Observable contention patterns                     │   │
-│  │                                                      │   │
-│  │ Result: SMT often degrades performance              │   │
-│  │         under high load                             │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  CIBOS WITH SMT:                                            │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ No locks: No thread contention                      │   │
-│  │ Isolated memory: No intentional cache thrashing     │   │
-│  │ Event-driven: No time-slicing                       │   │
-│  │ No shared state: No contention patterns            │   │
-│  │                                                      │   │
-│  │ Result: SMT provides additional execution          │   │
-│  │         contexts without software overhead          │   │
-│  │                                                      │   │
-│  │ Only hardware-level sharing remains:               │   │
-│  │ - L1/L2 cache sharing between logical cores         │   │
-│  │ - Execution unit sharing                            │   │
-│  │ - This is the ONLY overhead                        │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  SECURITY IMPLICATION:                                      │
-│  SMT in CIBOS adds capacity without adding contention.      │
-│  The hardware-level side channels are the only              │
-│  security consideration.                                    │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+### Signal Coalescence Security
+
+Signal coalescence should not create timing correlations that reveal container behavior:
+
+```bash
+cibos-test --signal-coalescence-security
+
+# Verify: No correlation between batch size and container activity
+# Verify: No observable dispatch timing correlation
+# Verify: Container selection independent of signal buffer age
 ```
 
 ---
 
-## Chapter 8: Hardware-Level Limitations
+## Chapter 9: Hardware-Level Limitations
 
-### What CIBOS Cannot Protect Against
+CIBOS documentation is honest about hardware-level limitations:
 
-```
-HARDWARE LIMITATIONS:
+**Intel Management Engine:** Operates below firmware. Can access all system memory. Cannot be prevented by CIBIOS. Mitigation: Use AMD or RISC-V platforms.
 
-┌─────────────────────────────────────────────────────────────┐
-│                   HARDWARE LIMITS                            │
-│                                                             │
-│  INTEL MANAGEMENT ENGINE (ME):                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Operates below firmware level                        │   │
-│  │ Can access all system memory                         │   │
-│  │ Can observe all execution                            │   │
-│  │ Proprietary, cannot be disabled                      │   │
-│  │                                                      │   │
-│  │ CIBIOS: Cannot prevent ME access                     │   │
-│  │ CIBOS: Cannot hide from ME observation               │   │
-│  │ Mitigation: Use AMD or RISC-V platforms              │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  AMD PLATFORM SECURITY PROCESSOR (PSP):                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Similar to Intel ME                                  │   │
-│  │ Operates below firmware                              │   │
-│  │ Proprietary                                          │   │
-│  │                                                      │   │
-│  │ CIBIOS: Cannot prevent PSP access                    │   │
-│  │ Mitigation: Use Intel or RISC-V platforms            │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ARM TRUSTZONE (when activated):                            │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Proprietary firmware in secure world                 │   │
-│  │ Introduced when hardware-vendor-trustzone enabled   │   │
-│  │ Default: not activated                               │   │
-│  │                                                      │   │
-│  │ CIBIOS: Cannot prevent secure world access           │   │
-│  │ Mitigation: Do not enable TrustZone feature         │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  CACHE TIMING SIDE CHANNELS:                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Cache access patterns can leak information           │   │
-│  │ Observable through timing                            │   │
-│  │ Physics-based, cannot be eliminated in software      │   │
-│  │                                                      │   │
-│  │ CIBOS: Architecture minimizes structured patterns    │   │
-│  │ RTRO: Adds noise to software signals                │   │
-│  │ Residual risk: Hardware signals remain               │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  PHYSICAL TAMPERING:                                        │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Physical access enables:                            │   │
-│  │ - Boot media modification                           │   │
-│  │ - Hardware implants                                 │   │
-│  │ - Side-channel equipment                            │   │
-│  │                                                      │   │
-│  │ CIBIOS: Cannot prevent physical access              │   │
-│  │ Mitigation: Physical security perimeter             │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+**AMD Platform Security Processor:** Similar to Intel ME. Cannot be prevented by CIBIOS.
 
-### Documented Limitations
+**ARM TrustZone (when activated):** Proprietary firmware with elevated privileges. Not activated by default. Do not enable `hardware-vendor-trustzone` unless trust model is explicitly accepted.
 
-Security documentation must honestly represent what CIBOS can and cannot protect against:
+**Cache Timing Side Channels:** Hardware physics. Cannot be eliminated in software. HIP's architecture minimizes structured information at hardware channels by eliminating global locks (no lock contention patterns to observe). RTRO obfuscates software-level timing signals. Hardware physics signals remain.
+
+**Physical Tampering:** Hardware implants, boot media modification, side-channel equipment. Addressed by physical security perimeter (Compute) or documented as residual risk (other profiles).
+
+---
+
+## Chapter 10: Security Audit Report Template
 
 ```
-DOCUMENTATION REQUIREMENTS:
+SECURITY AUDIT REPORT
 
-┌─────────────────────────────────────────────────────────────┐
-│                 DOCUMENTATION                                │
-│                                                             │
-│  MUST DOCUMENT:                                             │
-│  - Hardware-level limitations                              │
-│  - Physical security requirements                          │
-│  - Key management requirements                             │
-│  - Residual risks per profile                              │
-│  - What each profile protects against                     │
-│  - What each profile does NOT protect against             │
-│  - SMT security implications                               │
-│                                                             │
-│  MUST NOT CLAIM:                                            │
-│  - Protection against hardware surveillance                │
-│  - Protection against physical attacks                     │
-│  - Absolute security guarantees                            │
-│  - Protection against key compromise                       │
-│  - Elimination of all timing side channels                 │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+SYSTEM INFORMATION:
+  Profile: [Maximum Isolation / Balanced / Performance / Compute]
+  Architecture: [x86_64 / ARM64 / RISC-V]
+  CIBIOS version: [version]
+  CIBOS version: [version]
+  SMT Status: [Enabled / Disabled]
+  Compiled features: [list]
+  Audit date: [date]
+
+NO-GLOBAL-LOCKS VERIFICATION:
+  □ Code analysis (no Mutex, RwLock, spin locks): [PASS / FAIL]
+  □ No Tokio dependency in kernel/async-runtime: [PASS / FAIL]
+  □ No global task queue: [PASS / FAIL]
+  □ Ownership audit (all mutable state single-owned): [PASS / FAIL]
+  □ Dynamic weight ownership (selector-owned): [PASS / FAIL / N/A]
+  □ LaneExecutor: lane-local, single owner: [PASS / FAIL]
+  □ CibosWaker: signals via message, no locks: [PASS / FAIL]
+  □ Runtime analysis (thread sanitizer): [PASS / FAIL]
+  □ Contention test (linear scaling): [PASS / FAIL]
+  □ Dispatch model: all ready dispatch when no competition: [PASS / FAIL]
+  □ Dispatch model: entropy only when competition exists: [PASS / FAIL]
+
+ISOLATION BOUNDARY VERIFICATION:
+  □ Memory isolation (cross-container): [PASS / FAIL]
+  □ Lane isolation (within-container): [PASS / FAIL]
+  □ File system isolation: [PASS / FAIL]
+  □ Channel isolation (sender verification): [PASS / FAIL]
+  □ Container enumeration prevention: [PASS / FAIL]
+  □ Dynamic weight cross-container isolation: [PASS / FAIL / N/A]
+  □ Async runtime lane queue isolation: [PASS / FAIL]
+
+CONFIGURATION SECURITY:
+  □ Signature verification (tampering detected): [PASS / FAIL]
+  □ Config substitution test: [PASS / FAIL]
+  □ Unsigned config fallback (defaults applied, operational): [PASS / FAIL]
+  □ Key management audit: [PASS / FAIL]
+
+CHANNEL SECURITY:
+  □ Unauthorized request test: [PASS / FAIL]
+  □ Sender hijacking test: [PASS / FAIL]
+  □ Message injection test: [PASS / FAIL]
+  □ Channel enumeration test: [PASS / FAIL]
+  □ Rate limit enforcement: [PASS / FAIL]
+
+RTRO VERIFICATION (Maximum Isolation and Balanced only):
+  □ CPU usage obfuscation: [PASS / FAIL / N/A]
+  □ Timing pattern analysis resistance: [PASS / FAIL / N/A]
+  □ Throughput impact (< 5%): [PASS / FAIL / N/A]
+
+SMT VERIFICATION:
+  □ SMT status correct for profile: [PASS / FAIL]
+  □ Execution context count = physical × SMT factor: [PASS / FAIL]
+
+ASYNC RUNTIME SECURITY (All Profiles):
+  □ No global task queue: [PASS / FAIL]
+  □ No Tokio dependency: [PASS / FAIL]
+  □ .await stalls via kernel (no polling): [PASS / FAIL]
+  □ Lane queue isolation: [PASS / FAIL]
+
+SIGNAL COALESCENCE SECURITY (if compiled):
+  □ No timing patterns from batch processing: [PASS / FAIL / N/A]
+  □ Batch size uncorrelated with container behavior: [PASS / FAIL / N/A]
+
+CLASS RESOURCE POOLS (if compiled):
+  □ Cross-pool isolation maintained: [PASS / FAIL / N/A]
+  □ Pool exhaustion only affects same class: [PASS / FAIL / N/A]
+
+DYNAMIC WEIGHTS (if compiled — Compute profile):
+  □ Cross-container isolation maintained: [PASS / FAIL / N/A]
+  □ Weight updates message-based (no locks): [PASS / FAIL / N/A]
+  □ Compute-profile-only restriction enforced: [PASS / FAIL / N/A]
+
+RESIDUAL RISKS (documented, not failures):
+  □ Hardware surveillance limitations documented: [YES / NO]
+  □ Physical security requirements documented: [YES / NO]
+  □ Key management documented: [YES / NO]
+  □ SMT side channels documented (if enabled): [YES / NO]
+  □ Hardware timing signals documented: [YES / NO]
+
+OVERALL ASSESSMENT: [APPROVED / CONDITIONAL / FAILED]
+
+CONDITIONS (if conditional): [list]
+
+AUDITOR: [Name / Organization]
+DATE: [Date]
+NEXT AUDIT: [Date]
 ```
 
 ---
 
-## Chapter 9: Security Audit Report Template
-
-```
-AUDIT REPORT:
-
-┌─────────────────────────────────────────────────────────────┐
-│                   SECURITY AUDIT                             │
-│                                                             │
-│  SYSTEM INFORMATION:                                        │
-│  - Profile: [Maximum Isolation / Balanced / Performance / Compute]│
-│  - Architecture: [x86_64 / ARM64 / RISC-V]                │
-│  - CIBIOS version: [version]                                │
-│  - CIBOS version: [version]                                 │
-│  - SMT Status: [Enabled / Disabled]                        │
-│  - Audit date: [date]                                       │
-│                                                             │
-│  VERIFICATION RESULTS:                                      │
-│  ─────────────────────────────────────────────────────────  │
-│                                                             │
-│  NO-GLOBAL-LOCKS VERIFICATION:                              │
-│  □ Code analysis (no Mutex, RwLock, spin locks): [PASS / FAIL]│
-│  □ Ownership audit (single-owner for all mutable state):    │
-│    [PASS / FAIL]                                           │
-│  □ Runtime analysis (thread sanitizer): [PASS / FAIL]       │
-│  □ Contention test (linear scaling): [PASS / FAIL]          │
-│  □ Dispatch model: all ready events dispatch when no        │
-│    competition: [PASS / FAIL]                              │
-│  □ Dispatch model: weighted entropy used only when          │
-│    competition exists: [PASS / FAIL]                       │
-│                                                             │
-│  ISOLATION BOUNDARY VERIFICATION:                           │
-│  □ Memory isolation (cross-container): [PASS / FAIL]        │
-│  □ Lane isolation (within-container): [PASS / FAIL]         │
-│  □ File system isolation: [PASS / FAIL]                    │
-│  □ Channel isolation (sender verification): [PASS / FAIL]   │
-│  □ Container enumeration prevention: [PASS / FAIL]          │
-│                                                             │
-│  CONFIGURATION SECURITY:                                    │
-│  □ Signature verification (tampering detected): [PASS / FAIL]│
-│  □ Config substitution test: [PASS / FAIL]                  │
-│  □ Unsigned config test (defaults applied): [PASS / FAIL]    │
-│  □ Key management audit: [PASS / FAIL]                     │
-│                                                             │
-│  CHANNEL SECURITY:                                          │
-│  □ Unauthorized request test: [PASS / FAIL]                 │
-│  □ Sender hijacking test: [PASS / FAIL]                     │
-│  □ Message injection test: [PASS / FAIL]                    │
-│  □ Channel enumeration test: [PASS / FAIL]                  │
-│  □ Rate limit enforcement: [PASS / FAIL]                   │
-│                                                             │
-│  RTRO VERIFICATION (Maximum Isolation and Balanced only):    │
-│  □ CPU usage obfuscation: [PASS / FAIL / N/A]              │
-│  □ Timing pattern analysis: [PASS / FAIL / N/A]            │
-│  □ Throughput impact (< 5%): [PASS / FAIL / N/A]           │
-│                                                             │
-│  SMT VERIFICATION:                                          │
-│  □ SMT status correct for profile: [PASS / FAIL]            │
-│  □ Execution context count matches (physical × SMT factor):  │
-│    [PASS / FAIL]                                           │
-│                                                             │
-│  SIGNAL COALESCENCE VERIFICATION (if compiled in):          │
-│  □ No timing patterns from batch processing: [PASS / FAIL] │
-│  □ Batch size uncorrelated with container behavior:        │
-│    [PASS / FAIL]                                           │
-│  □ Processing overhead consistent: [PASS / FAIL]           │
-│                                                             │
-│  SIGNAL THRESHOLD VERIFICATION (if compiled in):            │
-│  □ Threshold affects signal processing only: [PASS / FAIL] │
-│  □ No dispatch timing correlation: [PASS / FAIL]           │
-│  □ Container selection independent of signal buffer:        │
-│    [PASS / FAIL]                                           │
-│                                                             │
-│  CLASS RESOURCE POOLS VERIFICATION (if compiled in):        │
-│  □ Cross-pool isolation maintained: [PASS / FAIL]          │
-│  □ Pool exhaustion only affects same-class: [PASS / FAIL]  │
-│  □ No cross-pool borrowing: [PASS / FAIL]                  │
-│                                                             │
-│  CORE AFFINITY VERIFICATION (if compiled in):               │
-│  □ Class-context boundaries enforced: [PASS / FAIL]        │
-│  □ Routing deterministic by class: [PASS / FAIL]           │
-│  □ No side channel from routing: [PASS / FAIL]             │
-│                                                             │
-│  SENSOR ISOLATION VERIFICATION (if compiled in):            │
-│  □ Complete sensor isolation: [PASS / FAIL]                │
-│  □ No cross-container observation: [PASS / FAIL]           │
-│  □ Per-access authorization enforced: [PASS / FAIL]        │
-│  □ System indicators accurate: [PASS / FAIL]               │
-│  □ Revocation immediate: [PASS / FAIL]                     │
-│                                                             │
-│  RESIDUAL RISKS (documented, not failures):                 │
-│  □ Hardware surveillance limitations documented: [YES / NO] │
-│  □ Physical security requirements documented: [YES / NO]    │
-│  □ Key management documented: [YES / NO]                    │
-│  □ SMT side channels documented (if SMT enabled): [YES / NO]│
-│  □ Hardware timing signals documented: [YES / NO]          │
-│                                                             │
-│  OVERALL ASSESSMENT:                                        │
-│  [APPROVED / CONDITIONAL / FAILED]                          │
-│                                                             │
-│  CONDITIONS (if conditional):                               │
-│  [List conditions that must be remediated]                  │
-│                                                             │
-│  AUDITOR: [Name / Organization]                              │
-│  DATE: [Date]                                               │
-│  NEXT AUDIT: [Date]                                         │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Conclusion
-
-CIBOS provides strong security guarantees within its threat model. Verification of these guarantees requires:
-- Code analysis for global lock absence
-- Runtime testing for isolation enforcement
-- Configuration security verification
-- Channel security testing
-- SMT security analysis
-- Honest documentation of residual risks
-
-Security is not absolute. CIBOS protects against software-based attacks and behavioral observation. Hardware-level attacks and physical attacks require physical security perimeters and operational security procedures.
-
----
-
-*This Security Analysis Guide covers security verification for CIBIOS and CIBOS. For deployment configuration, see the Administrator Guide. For implementation details, see the Developer Guide.*
+*For deployment guidance, see the Administrator Guide. For implementation details, see the Developer Guide.*
