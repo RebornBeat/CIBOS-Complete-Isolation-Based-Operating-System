@@ -3,9 +3,9 @@
 
 ## Introduction
 
-This guide covers everything you need to write applications for CIBOS. It explains the execution model, lane architecture, channel communication, and how to structure your application to take advantage of CIBOS's isolation properties and quantum-like computational capabilities.
+This guide covers everything you need to write applications for CIBOS. Because CIBOS supports multiple profiles with different feature flags, application design decisions can vary based on the deployment context. This guide covers both **profile-flexible design** (applications that work correctly across all profiles) and **profile-specific optimizations** (applications tuned for specific profiles).
 
-This guide does not cover system internals. For kernel implementation details, see the Developer Guide. For deployment, see the Administrator Guide.
+For most applications, the goal is profile-flexible design: write the application to work correctly regardless of which features are compiled in. Where profile-specific optimizations are valuable, they are clearly identified with conditional compilation guards.
 
 ---
 
@@ -13,1575 +13,671 @@ This guide does not cover system internals. For kernel implementation details, s
 
 ### Your Application Is a Container
 
-Every application running on CIBOS runs in its own container — an isolated execution environment with dedicated memory, resource limits, and security boundaries. Your application cannot access memory belonging to other applications. Other applications cannot observe your application's behavior.
-
-This isolation is architectural and unconditional. There is no permission level at which one application can access another's memory. There is no debug mode that bypasses isolation. Isolation is always active.
+Every application on CIBOS runs in a container — an isolated execution environment with dedicated memory, resource limits, and security boundaries. Your application cannot access memory belonging to other applications. Other applications cannot observe your application's behavior. This isolation is architectural and unconditional.
 
 ### Your Execution Unit Is a Lane
 
-Within your container, your application can create lanes. Each lane is an independent execution context with its own memory region and event queue. Your application controls what work each lane does.
+Within your container, you create lanes. Each lane is an isolated execution context with its own memory region and event queue. The kernel sees only the head event of each lane — it cannot see queue depth, future events, or relationships between lanes.
 
-The kernel sees only the head event of each lane — the next thing each lane needs to do. The kernel does not see your internal queue depth, your data structures, or your computation in progress.
+```
+LANE INTERNAL VIEW vs KERNEL VIEW:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  WHAT YOU SEE (Application View):                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Lane Queue:                                                        │    │
+│  │  ┌───────┐  ┌───────┐  ┌───────┐  ┌───────┐                        │    │
+│  │  │ HEAD  │  │  #2   │  │  #3   │  │  #4   │                        │    │
+│  │  │ Event │  │ Event │  │ Event │  │ Event │  ← All yours, private  │    │
+│  │  └───────┘  └───────┘  └───────┘  └───────┘                        │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                     │                                                       │
+│                     │ Kernel sees ONLY the HEAD                             │
+│                     ▼                                                       │
+│  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ KERNEL BOUNDARY ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─         │
+│                                                                             │
+│  WHAT KERNEL SEES (Ready Pool):                                             │
+│  ┌──────────────────────────────────────────────────────────────────┐       │
+│  │  ┌───────┐  ┌───────┐  ┌───────┐  ┌───────┐                     │       │
+│  │  │ Lane 1│  │ Lane 2│  │ Lane 3│  │ Lane N│                     │       │
+│  │  │ HEAD  │  │ HEAD  │  │ HEAD  │  │ HEAD  │                     │       │
+│  │  │ only  │  │ only  │  │ only  │  │ only  │                     │       │
+│  │  └───────┘  └───────┘  └───────┘  └───────┘                     │       │
+│  │  Kernel CANNOT see: queue depth, future events, internal order   │       │
+│  └──────────────────────────────────────────────────────────────────┘       │
+│                                                                             │
+│  WHY THIS MATTERS:                                                          │
+│  - Kernel cannot leak information about your queue state                    │
+│  - Other containers cannot observe your queue depth                         │
+│  - Timing attacks cannot infer queue state                                  │
+│  - Your internal ordering is completely private                             │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Async/Await and the Event Model
+
+Lane work is submitted as async blocks. Each `.await` point is a potential stall point — if the awaited resource is unavailable, the event stalls transparently (Catch and Release). When the resource becomes available, the kernel resumes the event at exactly the `.await` point.
+
+```
+ASYNC/AWAIT TO EVENT MODEL MAPPING:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  Each .await is a potential STALL point:                                    │
+│                                                                             │
+│  lane.submit(async {                                                        │
+│                                                                             │
+│      // Event starts — if resources available → Ready Pool                  │
+│      //                if resources unavailable → Stalled List              │
+│                                                                             │
+│      let data = channel.receive().await;                                    │
+│      //                            ▲                                        │
+│      //               Potential stall point                                 │
+│      //  Channel empty → Poll::Pending                                      │
+│      //    → Kernel tracks ChannelData dependency                           │
+│      //    → Event moves to Stalled List                                    │
+│      //    → NO polling, NO retry, NO spin-wait                             │
+│      //    → When data arrives → resource signal                            │
+│      //    → Kernel qualifies ALL resources                                 │
+│      //    → Event → Ready Pool → dispatched                                │
+│      //    → wake() called → poll() again → Poll::Ready                     │
+│      //    → Execution resumes HERE                                         │
+│                                                                             │
+│      process(data);  // Runs synchronously until next .await               │
+│                                                                             │
+│      Timer::sleep(Duration::from_millis(100)).await;                        │
+│      //   Kernel timer event — no thread sleeping                           │
+│      //   Timer fires → event moves to Ready Pool → resumes here            │
+│                                                                             │
+│      send(result).await;                                                    │
+│      //   Buffer full → stalls until space available                        │
+│      //   Transparent — no retry code needed                                │
+│                                                                             │
+│      // Event completes — next event in lane queue becomes HEAD             │
+│  });                                                                        │
+│                                                                             │
+│  KEY:                                                                       │
+│  async block = ExecutionEvent                                               │
+│  .await      = potential stall point (resource check via kernel)            │
+│  Poll::Ready = resource available, continue                                 │
+│  Poll::Pending = resource unavailable, kernel tracks, event stalls          │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Important:** CIBOS uses its own async runtime. Do NOT use `tokio::spawn()`, `tokio::sync::Mutex`, or any standard runtime primitives — these use global locks and are incompatible with HIP. Use CIBOS's lane and channel primitives.
 
 ### You Communicate Through Channels
 
-When your application needs to exchange data with another application, you use channels. Channels require the other application's explicit agreement. Once established, channels carry messages in either or both directions.
-
-Channels are your only authorized inter-application communication mechanism. There is no shared memory between applications, no signals, no shared files accessible to both.
-
-### The Two-Layer Execution Model from the Application Perspective
-
-**Layer 1 (Catch and Release):** When your lane has work and all required resources are available, your lane's head event enters the Ready Pool and is eligible for dispatch. If resources are unavailable, your lane stalls invisibly — no retry loops, no spinning.
-
-**Layer 2 (Dispatch):** When your event is in the Ready Pool, the kernel dispatches it either immediately (if execution contexts are available and no competition exists) or after weighted entropy selection (if competition exists). You do not control or observe this process.
-
-### What "Competition" Means for Your Application
-
-Competition exists when more events are ready than execution contexts are available. In practice:
-- On a lightly loaded system, all your ready lanes likely dispatch immediately without selection
-- On a heavily loaded system, weighted entropy may delay some of your lanes
-- Anti-starvation (when compiled) ensures no lane waits indefinitely in the Ready Pool
-
-### The System Selects Events Probabilistically
-
-When your lane has something ready to execute, the kernel selects your lane's event using weighted entropy selection. You are not guaranteed to be selected immediately. You might be selected very quickly; you might wait through several dispatch opportunities. The selection is probabilistic, determined by your container's weight class relative to other ready events.
-
-This is by design. Deterministic selection order would create observable patterns that could be used for timing attacks. Probabilistic selection provides the non-determinism that enables quantum-like computational properties.
+When your application needs to exchange data with another application, you use channels. Channels require the other application's explicit agreement. Terms are proposed by the requester — the receiver accepts all or rejects entirely. No counter-proposal.
 
 ---
 
 ## Chapter 2: Working with Lanes
 
-### What Lanes Provide
-
-Lanes provide parallel execution without coordination overhead. When you create multiple lanes, each can execute independently. They do not share memory, do not need locks, and do not coordinate through any mechanism other than channels you explicitly create.
-
-**Key properties:**
-- Each lane has isolated memory
-- Each lane has an independent event queue
-- Lanes execute independently when selected
-- No locks between lanes
-- No shared mutable state
-
 ### Creating Lanes
 
-```
-LANE CREATION:
+```rust
+// Standard lane creation — works on ALL profiles
+let mut lane = Lane::create()?;
 
-┌─────────────────────────────────────────────────────────────┐
-│                    LANE CREATION                             │
-│                                                             │
-│  BASIC LANE:                                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Create a lane with default weight                │   │
-│  │ // Weight is determined by container's class        │   │
-│  │ let lane = Lane::create()?;                         │   │
-│  │                                                     │   │
-│  │ // Lane ID is assigned by the system                │   │
-│  │ println!("Created lane: {}", lane.id());            │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  LANE WITH EXPLICIT WEIGHT (Compute Profile Only):         │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Create lane with specific weight                 │   │
-│  │ // Only available when per-lane-weights compiled    │   │
-│  │ let priority_lane = Lane::create_with_weight(5)?;   │   │
-│  │ let normal_lane = Lane::create_with_weight(1)?;     │   │
-│  │ let background_lane = Lane::create_with_weight(1)?; │   │
-│  │                                                     │   │
-│  │ // Higher weight = higher selection probability     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+// Lane with explicit weight — ONLY when per-lane-weights compiled in (Compute)
+#[cfg(feature = "per-lane-weights")]
+let priority_lane = Lane::create_with_weight(5)?;
+
+// Profile-flexible pattern: use explicit weight if available, fall back otherwise
+fn create_priority_lane() -> Result<Lane, LaneError> {
+    #[cfg(feature = "per-lane-weights")]
+    return Lane::create_with_weight(5);
+    #[cfg(not(feature = "per-lane-weights"))]
+    return Lane::create();
+}
 ```
 
-### Lane Lifecycle
+### Submitting Work
 
-```
-LANE LIFECYCLE:
+```rust
+// Submit an async block — FIFO within this lane
+lane.submit(async move {
+    let result = compute(input).await;
+    channel.send(result).await?;
+})?;
 
-┌─────────────────────────────────────────────────────────────┐
-│                    LANE LIFECYCLE                            │
-│                                                             │
-│  1. Created → INACTIVE                                      │
-│  2. Work submitted → Has head event                         │
-│  3. Head event ready → May be selected                      │
-│  4. Selected → EXECUTING                                    │
-│  5. Complete or Stall                                       │
-│  6. If complete and more work → New head event              │
-│  7. If no more work → INACTIVE                              │
-│  8. Destroyed when container ends                           │
-│                                                             │
-│  STATE TRANSITIONS:                                         │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ INACTIVE                                            │   │
-│  │    ↓ (work submitted)                              │   │
-│  │ READY (in Ready Pool)                              │   │
-│  │    ↓ (selected)                                    │   │
-│  │ EXECUTING                                           │   │
-│  │    ├─→ (completes, more work) → READY              │   │
-│  │    ├─→ (completes, no work) → INACTIVE            │   │
-│  │    └─→ (resource unavailable) → STALLED           │   │
-│  │                                                     │   │
-│  │ STALLED                                             │   │
-│  │    └─→ (resource available) → READY                │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  DESTROYING LANES:                                          │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Graceful destroy (waits for current event)       │   │
-│  │ lane.destroy()?;                                     │   │
-│  │                                                     │   │
-│  │ // Immediate destroy (cancels pending)              │   │
-│  │ lane.destroy_immediate()?;                           │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+// Multiple submissions — execute in order within this lane
+lane.submit(work_item_1)?;
+lane.submit(work_item_2)?;  // Guaranteed to run AFTER work_item_1 in this lane
+lane.submit(work_item_3)?;  // Guaranteed to run AFTER work_item_2 in this lane
 ```
 
-### Submitting Work to a Lane
+### Lane Ordering
 
 ```
-SUBMITTING WORK:
+ORDERING GUARANTEES:
 
-┌─────────────────────────────────────────────────────────────┐
-│                   WORK SUBMISSION                            │
-│                                                             │
-│  ASYNC WORK:                                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ lane.submit(async move {                            │   │
-│  │     // This closure executes when lane is selected  │   │
-│  │     let result = compute(input).await;              │   │
-│  │     result                                          │   │
-│  │ })?;                                                │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  WORK WITH ERROR HANDLING:                                  │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ lane.submit(async move {                            │   │
-│  │     match perform_work().await {                    │   │
-│  │         Ok(result) => {                             │   │
-│  │             // Work succeeded                       │   │
-│  │             handle_result(result);                  │   │
-│  │         }                                           │   │
-│  │         Err(e) => {                                 │   │
-│  │             // Work failed                          │   │
-│  │             log::error!("Work failed: {}", e);      │   │
-│  │         }                                           │   │
-│  │     }                                               │   │
-│  │ })?;                                                │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  MULTIPLE WORK ITEMS:                                       │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Lanes process work in FIFO order                 │   │
-│  │ // within the lane                                   │   │
-│  │ lane.submit(work_item_1)?;                           │   │
-│  │ lane.submit(work_item_2)?;                           │   │
-│  │ lane.submit(work_item_3)?;                           │   │
-│  │                                                     │   │
-│  │ // Items execute: 1, then 2, then 3                 │   │
-│  │ // Order within lane is guaranteed                  │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+Within a lane: FIFO guaranteed
+  Submit A, then B, then C → executes A, then B, then C
+
+Across lanes: NO ordering guarantee
+  Lane 1: [A, B]
+  Lane 2: [X, Y]
+  Possible orderings: A,X,B,Y or X,A,Y,B or A,X,Y,B or ...
+  Selection is entropy-based — unpredictable
+
+If cross-lane ordering is needed: use channels
+  Lane 1: compute result, send to channel
+  Lane 2: receive from channel, then proceed
+  → Lane 2's work runs after Lane 1's work completes (explicit dependency)
 ```
 
-### Lane FIFO Ordering
+### Dynamic Weights (Compute Profile Only)
 
-```
-LANE FIFO ORDERING:
+```rust
+// Update lane weight at runtime — Compute profile with dynamic-weights only
+// Sends a message to selector — no locks, no waiting
+#[cfg(feature = "dynamic-weights")]
+lane.update_weight(5)?;  // Priority lane
 
-┌─────────────────────────────────────────────────────────────┐
-│                    LANE ORDERING                             │
-│                                                             │
-│  WITHIN A LANE: FIFO (First-In-First-Out)                  │
-│                                                             │
-│  Lane Queue:                                                │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ [Head Event A] → [Event B] → [Event C] → [Event D]  │   │
-│  │        ↓                                            │   │
-│  │   Executing                                          │   │
-│  │                                                     │   │
-│  │ When A completes, B becomes head                    │   │
-│  │ When B completes, C becomes head                    │   │
-│  │ When C completes, D becomes head                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ACROSS LANES: NO ORDERING GUARANTEE                       │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Lane 1: [Event A, Event B]                          │   │
-│  │ Lane 2: [Event X, Event Y]                          │   │
-│  │ Lane 3: [Event M, Event N]                          │   │
-│  │                                                     │   │
-│  │ Possible execution order:                           │   │
-│  │   A, X, M, B, Y, N  (one possible order)           │   │
-│  │   X, A, M, Y, B, N  (another possible order)       │   │
-│  │   M, A, X, N, B, Y  (another possible order)       │   │
-│  │                                                     │   │
-│  │ Selection is by weighted entropy                    │   │
-│  │ Order is non-deterministic                          │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  KEY INSIGHT:                                               │
-│  If you need ordering across lanes, use channels           │
-│  to coordinate between them.                                │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+// Profile-flexible: no-op on other profiles
+fn set_priority(lane: &Lane, high: bool) {
+    #[cfg(feature = "dynamic-weights")]
+    {
+        let weight = if high { 5 } else { 1 };
+        let _ = lane.update_weight(weight);
+    }
+    // On other profiles: application continues working correctly
+}
 ```
 
-### When to Use Multiple Lanes
-
-```
-WHEN TO USE MULTIPLE LANES:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    USE CASES                                 │
-│                                                             │
-│  USE MULTIPLE LANES WHEN:                                   │
-│                                                             │
-│  1. PARALLEL EXPLORATION                                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Problem: Explore multiple solution approaches       │   │
-│  │ Solution: One lane per approach                     │   │
-│  │                                                     │   │
-│  │ Lane 1: Approach A                                  │   │
-│  │ Lane 2: Approach B                                  │   │
-│  │ Lane 3: Approach C                                  │   │
-│  │                                                     │   │
-│  │ All execute in parallel, no coordination            │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  2. PIPELINE PROCESSING                                     │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Problem: Data flows through processing stages       │   │
-│  │ Solution: One lane per stage                        │   │
-│  │                                                     │   │
-│  │ Lane 1: Read input                                  │   │
-│  │ Lane 2: Process data                                │   │
-│  │ Lane 3: Write output                                │   │
-│  │                                                     │   │
-│  │ Stages proceed independently                        │   │
-│  │ Communication via channels                          │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  3. OVERLAPPING I/O AND COMPUTE                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Problem: Compute while waiting for I/O              │   │
-│  │ Solution: Separate lanes for I/O and compute        │   │
-│  │                                                     │   │
-│  │ Lane 1: I/O operations (can stall)                  │   │
-│  │ Lane 2: Computation (proceeds independently)        │   │
-│  │                                                     │   │
-│  │ Compute doesn't wait for I/O                        │   │
-│  │ I/O doesn't block compute                           │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  4. INDEPENDENT TASKS                                       │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Problem: Multiple independent tasks                 │   │
-│  │ Solution: One lane per task                         │   │
-│  │                                                     │   │
-│  │ Lane 1: Task 1                                      │   │
-│  │ Lane 2: Task 2                                      │   │
-│  │ Lane 3: Task 3                                      │   │
-│  │                                                     │   │
-│  │ Tasks don't interfere with each other               │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  DO NOT USE MULTIPLE LANES WHEN:                            │
-│                                                             │
-│  - Tasks are sequential (one task depends on previous)      │
-│  - Single task, single thread is sufficient                │
-│  - Tasks require extensive coordination                     │
-│  - Memory overhead of multiple lanes is not justified      │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+**Why dynamic weights are acceptable only in Compute:** Weight changes create observable timing patterns. In Maximum Isolation/Balanced (adversarial environment), this is information leakage. In Compute (air-gapped, single user, no adversary), predictability is acceptable and can be beneficial for workflow phase management.
 
 ---
 
 ## Chapter 3: Channel Communication
 
-### Channel Basics
-
-```
-CHANNEL BASICS:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    CHANNEL OVERVIEW                          │
-│                                                             │
-│  WHAT A CHANNEL IS:                                         │
-│  - Point-to-point communication link                       │
-│  - Between exactly two containers                          │
-│  - Created by mutual agreement                             │
-│  - Isolated from other channels                            │
-│                                                             │
-│  WHAT A CHANNEL IS NOT:                                     │
-│  - Not broadcast                                            │
-│  - Not routable                                             │
-│  - Not discoverable                                         │
-│  - Not shared memory                                        │
-│                                                             │
-│  DIRECTIONALITY:                                            │
-│  - One-way: A can send to B, B cannot send to A            │
-│  - Bidirectional: Both can send                             │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
 ### Creating Channels
 
-```
-CREATING CHANNELS:
+```rust
+// Request a channel to another container
+let request = ChannelRequest {
+    target: other_container_id,
+    terms: ChannelTerms {
+        direction: Direction::Bidirectional,
+        rate_limit: Some(RateLimit::MessagesPerSec(1000)),
+        buffer_size: 256,
+        lifetime: ChannelLifetime::Permanent,
+    },
+};
 
-┌─────────────────────────────────────────────────────────────┐
-│                  CHANNEL CREATION                            │
-│                                                             │
-│  REQUEST A CHANNEL:                                         │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ let request = ChannelRequest {                      │   │
-│  │     target: other_container_id,                     │   │
-│  │     terms: ChannelTerms {                           │   │
-│  │         direction: Direction::Bidirectional,        │   │
-│  │         rate_limit: Some(RateLimit::MessagesPerSec(1000)),│
-│  │         buffer_size: 256,                           │   │
-│  │         lifetime: ChannelLifetime::Permanent,       │   │
-│  │     },                                              │   │
-│  │ };                                                   │   │
-│  │                                                      │   │
-│  │ let channel = Channel::request(request).await?;     │   │
-│  │ // This awaits acceptance from the target           │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ACCEPT INCOMING REQUEST:                                   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Wait for incoming channel request                │   │
-│  │ let incoming = container.await_channel_request().await?;│
-│  │                                                      │   │
-│  │ // Accept with original terms                        │   │
-│  │ let channel = incoming.accept()?;                   │   │
-│  │                                                      │   │
-│  │ // Or reject                                         │   │
-│  │ incoming.reject(Some("Reason"));                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+let channel = Channel::request(request).await?;  // Awaits acceptance
+
+// Accept incoming request
+let incoming = container.await_channel_request().await?;
+let channel = incoming.accept()?;   // Accept ALL terms
+// Or: incoming.reject(Some("Not available"));
 ```
 
-### Channel Terms Are Not Negotiable
+### Terms Are Not Negotiable
 
-**Important:** B cannot modify terms and send a counter-proposal. The options are accept-all or reject. If different terms are needed:
-1. B rejects
-2. A sends a new request with modified terms
-3. B accepts or rejects the new request
+Channel terms are proposed by the requester. The receiver accepts all or rejects. There is no counter-proposal mechanism. If different terms are needed, the requester sends a new request. This design prevents negotiation overhead and timing leakage from negotiation patterns.
 
-This is application-level logic, not kernel negotiation. Terms are defined by the proposing application's design and are not dynamically negotiable between applications.
+### Sending and Receiving
 
-### Sending and Receiving Messages
+```rust
+// Send — may stall if buffer full (transparent, no retry code needed)
+channel.send(message).await?;
 
-```
-SENDING AND RECEIVING:
+// Receive — may stall if buffer empty (transparent)
+let message = channel.receive().await?;
 
-┌─────────────────────────────────────────────────────────────┐
-│                 MESSAGE OPERATIONS                           │
-│                                                             │
-│  SEND MESSAGE:                                              │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ let message = Message::new()                        │   │
-│  │     .data(my_data)                                   │   │
-│  │     .priority(Priority::Normal);                    │   │
-│  │                                                      │   │
-│  │ channel.send(message).await?;                        │   │
-│  │                                                      │   │
-│  │ // If channel buffer is full:                        │   │
-│  │ // - This operation stalls                          │   │
-│  │ // - No retry loop needed                           │   │
-│  │ // - Resumes when buffer space available            │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  RECEIVE MESSAGE:                                           │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ let message = channel.receive().await?;             │   │
-│  │                                                      │   │
-│  │ // If channel buffer is empty:                       │   │
-│  │ // - This operation stalls                          │   │
-│  │ // - No retry loop needed                           │   │
-│  │ // - Resumes when message available                 │   │
-│  │                                                      │   │
-│  │ process(message.data());                             │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  NON-BLOCKING OPERATIONS:                                   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Try to receive without stalling                   │   │
-│  │ match channel.try_receive() {                        │   │
-│  │     Some(message) => process(message),              │   │
-│  │     None => {                                       │   │
-│  │         // No message available, do other work       │   │
-│  │         do_other_work();                             │   │
-│  │     }                                               │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+// Non-blocking receive
+match channel.try_receive() {
+    Some(message) => process(message),
+    None => do_other_work(),   // No data yet — don't spin
+}
 ```
 
-### Channel Rate Limits
+### IPC Security by Profile
 
-```
-RATE LIMITS:
+The security model of channel communication is determined at build time and is transparent to application code:
 
-┌─────────────────────────────────────────────────────────────┐
-│                    RATE LIMITS                               │
-│                                                             │
-│  SETTING RATE LIMITS:                                       │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ ChannelTerms {                                      │   │
-│  │     rate_limit: Some(RateLimit::MessagesPerSec(1000)),│
-│  │     // Or:                                          │   │
-│  │     rate_limit: Some(RateLimit::BytesPerSec(1024*1024)),│
-│  │     // Or:                                          │   │
-│  │     rate_limit: None, // No limit                   │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  WHAT RATE LIMITS DO:                                       │
-│  - Enforced by the kernel                                   │
-│  - Sender cannot exceed limit                               │
-│  - Sends above limit stall until rate window resets        │
-│                                                             │
-│  WHY USE RATE LIMITS:                                       │
-│  - Protect receiver from being overwhelmed                 │
-│  - Establish behavioral contract                            │
-│  - Prevent one fast sender from starving others            │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+- **Cryptographic mode** (Maximum Isolation, Balanced): Every message is signed and verified by CIBOS. Application code is identical.
+- **Lightweight handshake** (Compute): Channel identity verified once at creation. No per-message crypto. Application code is identical.
 
-### Channel Error Handling
-
-```
-CHANNEL ERRORS:
-
-┌─────────────────────────────────────────────────────────────┐
-│                  ERROR HANDLING                              │
-│                                                             │
-│  COMMON ERRORS:                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ ChannelError::Closed                                │   │
-│  │   // Channel was closed                             │   │
-│  │   // Cannot send or receive                         │   │
-│  │                                                      │   │
-│  │ ChannelError::RateLimited                           │   │
-│  │   // Rate limit exceeded                            │   │
-│  │   // Wait for rate window reset                     │   │
-│  │                                                      │   │
-│  │ ChannelError::Rejected                              │   │
-│  │   // Channel request was rejected                   │   │
-│  │   // Target refused the channel                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  HANDLING CLOSED CHANNEL:                                   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ match channel.receive().await {                     │   │
-│  │     Ok(message) => process(message),                │   │
-│  │     Err(ChannelError::Closed) => {                  │   │
-│  │         // Channel closed by other end              │   │
-│  │         cleanup();                                   │   │
-│  │         maybe_reconnect();                           │   │
-│  │     }                                               │   │
-│  │     Err(e) => {                                      │   │
-│  │         // Other error                               │   │
-│  │         log::error!("Channel error: {}", e);        │   │
-│  │     }                                               │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+Write your channel code normally — the profile determines the security guarantees.
 
 ---
 
 ## Chapter 4: Resource Awareness
 
-### What Resources Can Cause Stalls
-
-```
-RESOURCES:
-
-┌─────────────────────────────────────────────────────────────┐
-│                  STALL CAUSES                                │
-│                                                             │
-│  MEMORY:                                                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Cause: Container memory limit exceeded              │   │
-│  │ Effect: Allocation stalls                           │   │
-│  │ Resolution: Free memory within container            │   │
-│  │                                                     │   │
-│  │ Example:                                            │   │
-│  │   let data = vec![0u8; 1024*1024]; // 1 MB         │   │
-│  │   // If limit exceeded, this stalls                │   │
-│  │   // No OOM crash - system waits                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  CHANNEL BUFFERS:                                           │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Cause: Send to full buffer                          │   │
-│  │ Effect: Send operation stalls                       │   │
-│  │ Resolution: Receiver reads from buffer               │   │
-│  │                                                     │   │
-│  │ Cause: Receive from empty buffer                    │   │
-│  │ Effect: Receive operation stalls                    │   │
-│  │ Resolution: Sender writes to buffer                  │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  I/O OPERATIONS:                                            │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Cause: Disk/network operation pending               │   │
-│  │ Effect: Operation stalls until complete             │   │
-│  │ Resolution: Hardware signals completion             │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
 ### Stalls Are Transparent
 
-When your application stalls, you do not need to detect or handle it. Your application's execution simply pauses at the stalling operation and resumes when the resource becomes available. There are no retry loops needed. The kernel handles everything.
+When resources are unavailable, operations stall transparently. No retry loops needed:
 
 ```rust
-// This is wrong — never do this
+// WRONG — never do this:
 while !resource_available() {
-    sleep(10ms);
+    std::thread::sleep(Duration::from_millis(10));  // Breaks the model
 }
 
-// This is right — let the kernel handle it
+// RIGHT — let the kernel handle it:
 let data = allocate(size).await?;
-// If unavailable, stalls transparently until available
+// If unavailable → stalls invisibly until available → resumes here
 ```
 
-### Designing for Resource Constraints
+### Checking Resources Before Stalling
 
-```
-DESIGN PRINCIPLES:
+```rust
+let limits = container.get_resource_limits();
+let available = container.memory_available();
 
-┌─────────────────────────────────────────────────────────────┐
-│                 DESIGN GUIDELINES                            │
-│                                                             │
-│  1. KNOW YOUR LIMITS                                        │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ let limits = container.get_resource_limits();       │   │
-│  │ println!("Memory limit: {} MB", limits.memory_mb);  │   │
-│  │ println!("Channels: {}", limits.max_channels);      │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  2. WORK WITHIN LIMITS                                      │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Don't assume unlimited resources                 │   │
-│  │ // Design for your limits                           │   │
-│  │                                                     │   │
-│  │ // Bad: Assume infinite memory                      │   │
-│  │ let all_data = load_everything();                   │   │
-│  │                                                     │   │
-│  │ // Good: Work in chunks                             │   │
-│  │ loop {                                              │   │
-│  │     let chunk = load_chunk(CHUNK_SIZE)?;            │   │
-│  │     if chunk.is_empty() { break; }                  │   │
-│  │     process(chunk);                                 │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  3. RELEASE PROMPTLY                                        │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Free resources when done                         │   │
-│  │ let buffer = allocate(size)?;                        │   │
-│  │ use(buffer);                                         │   │
-│  │ deallocate(buffer)?; // Free for other lanes        │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  4. DESIGN FOR LATENCY                                      │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Execution may be delayed                          │   │
-│  │ // Design to handle variable timing                  │   │
-│  │                                                     │   │
-│  │ async fn process() {                                │   │
-│  │     // Work may be delayed - that's fine            │   │
-│  │     // Kernel will schedule when ready              │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Handling Execution Latency
-
-```
-EXECUTION LATENCY:
-
-┌─────────────────────────────────────────────────────────────┐
-│                   LATENCY HANDLING                           │
-│                                                             │
-│  LATENCY SOURCES:                                           │
-│  - Other containers competing for execution                 │
-│  - Resource unavailability                                 │
-│  - Weight class relative to other ready events             │
-│                                                             │
-│  DESIGN APPROACH:                                           │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Don't assume immediate execution                 │   │
-│  │ // Don't retry - let the kernel handle it           │   │
-│  │                                                     │   │
-│  │ // Wrong:                                           │   │
-│  │ while !try_execute() {                              │   │
-│  │     sleep(100ms); // Don't do this                  │   │
-│  │ }                                                    │   │
-│  │                                                     │   │
-│  │ // Right:                                           │   │
-│  │ execute().await; // Kernel handles timing           │   │
-│  │ // You'll execute when selected                     │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  IF YOU NEED A TIMEOUT:                                     │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Application-level timeout                         │   │
-│  │ match timeout(Duration::from_secs(30), operation()).await {│
-│  │     Ok(result) => handle(result),                   │   │
-│  │     Err(Timeout) => {                               │   │
-│  │         // Operation didn't complete in time         │   │
-│  │         // May still be pending or stalled          │   │
-│  │         handle_timeout();                            │   │
-│  │     }                                               │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+if size > available {
+    // Choose a smaller operation or chunk the work
+    process_in_chunks(data, CHUNK_SIZE).await?;
+} else {
+    let buffer = allocate(size).await?;
+    process(buffer).await?;
+}
 ```
 
 ### Timer-Based Operations
 
+Time is available as an event source on all profiles:
+
 ```rust
-// Sleep for 100 milliseconds
+// Sleep — available on ALL profiles
 Timer::sleep(Duration::from_millis(100)).await;
 
-// Set a timeout on an operation
-let result = with_timeout(Duration::from_secs(5), async {
-    channel.receive().await
-}).await;
-
-match result {
+// Timeout — available on ALL profiles
+match with_timeout(Duration::from_secs(5), channel.receive()).await {
     Ok(Ok(message)) => process(message),
-    Ok(Err(e)) => handle_channel_error(e),
-    Err(TimeoutError) => handle_timeout(),
+    Ok(Err(e))       => handle_channel_error(e),
+    Err(Timeout)     => handle_timeout(),
+}
+
+// Periodic task
+loop {
+    do_periodic_work().await?;
+    Timer::sleep(Duration::from_secs(60)).await;
 }
 ```
 
-Timers work through the kernel's timer event mechanism. When you call `sleep`, the kernel registers a timer event. When the timer fires, the timer event enters the Ready Pool and your lane competes for dispatch. You do not hold CPU while sleeping.
+**How timers work:** Timer fires → timer event enters Ready Pool → competes for dispatch → your code executes. Time GENERATES events. The kernel does NOT use time to coordinate dispatch decisions (Maximum Isolation, Balanced). For Performance and Compute, time-based mechanisms can influence scheduling (anti-starvation, full-fairness) but this is transparent to application code.
 
 ---
 
 ## Chapter 5: Quantum-Like Programming Patterns
 
-CIBOS's lane architecture enables quantum-like parallel computation. All lane results are preserved — there is no collapse. One run is sufficient.
+CIBOS's lane architecture enables quantum-like parallel computation. All lane results are preserved — no collapse. One run is sufficient.
 
 ### Parallel Pathway Maintenance
 
-```
-PARALLEL PATHWAYS:
+```rust
+async fn parallel_search(problem: Problem) -> Vec<Solution> {
+    let (sender, receiver) = Channel::new_local();
+    let lane_count = 8; // Or determine dynamically
+    let mut lanes = Vec::new();
 
-┌─────────────────────────────────────────────────────────────┐
-│               PARALLEL PATHWAY PATTERN                       │
-│                                                             │
-│  CONCEPT:                                                   │
-│  Create multiple lanes for multiple approaches.            │
-│  All execute in parallel.                                  │
-│  Collect results when done.                                │
-│  No collapse - all results preserved.                      │
-│                                                             │
-│  IMPLEMENTATION:                                            │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ async fn parallel_search(problem: Problem) -> Solution {│
-│  │     // Create lanes for each approach                │   │
-│  │     let lane1 = Lane::create()?;                     │   │
-│  │     let lane2 = Lane::create()?;                     │   │
-│  │     let lane3 = Lane::create()?;                     │   │
-│  │                                                      │   │
-│  │     // Result collection channel                     │   │
-│  │     let (sender, receiver) = Channel::new_local();   │   │
-│  │                                                      │   │
-│  │     // Submit each approach                          │   │
-│  │     let s1 = sender.clone();                         │   │
-│  │     lane1.submit(async move {                        │   │
-│  │         let solution = approach_a(&problem).await;   │   │
-│  │         s1.send(solution).await                      │   │
-│  │     })?;                                             │   │
-│  │                                                      │   │
-│  │     let s2 = sender.clone();                         │   │
-│  │     lane2.submit(async move {                        │   │
-│  │         let solution = approach_b(&problem).await;   │   │
-│  │         s2.send(solution).await                      │   │
-│  │     })?;                                             │   │
-│  │                                                      │   │
-│  │     let s3 = sender.clone();                         │   │
-│  │     lane3.submit(async move {                        │   │
-│  │         let solution = approach_c(&problem).await;   │   │
-│  │         s3.send(solution).await                      │   │
-│  │     })?;                                             │   │
-│  │                                                      │   │
-│  │     // Collect first result                          │   │
-│  │     let first = receiver.receive().await?;           │   │
-│  │                                                      │   │
-│  │     // Or collect all results                        │   │
-│  │     let results = vec![                              │   │
-│  │         receiver.receive().await?,                   │   │
-│  │         receiver.receive().await?,                   │   │
-│  │         receiver.receive().await?,                   │   │
-│  │     ];                                               │   │
-│  │                                                      │   │
-│  │     // Select best or combine                        │   │
-│  │     best_solution(results)                           │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+    for i in 0..lane_count {
+        let mut lane = Lane::create()?;
+        let approach = get_approach(i, &problem);
+        let s = sender.clone();
+        lane.submit(async move {
+            let solution = approach.solve().await;
+            s.send((i, solution)).await?;
+        })?;
+        lanes.push(lane);
+    }
+
+    // Collect ALL results — no collapse, all preserved
+    let mut results = Vec::with_capacity(lane_count);
+    for _ in 0..lane_count {
+        results.push(receiver.receive().await?);
+    }
+
+    // Application controls resolution — all strategies:
+    // Take first: results.into_iter().next()?
+    // Take best:  results.into_iter().max_by_key(|r| r.quality_score())?
+    // Combine:    combine_all(results)
+    // Use all:    for result in results { analyze(result); }
+    results
+}
+```
+
+When no competition exists (8 lanes, 16 execution contexts), all 8 dispatch simultaneously — truly parallel, zero selection overhead, 100% results preserved.
+
+### Pipeline Processing
+
+```rust
+async fn pipeline(input: InputChannel, output: OutputChannel) {
+    let mut read_lane    = Lane::create()?;
+    let mut process_lane = Lane::create()?;
+    let mut write_lane   = Lane::create()?;
+
+    let (raw_s, raw_r)   = Channel::new_local();
+    let (proc_s, proc_r) = Channel::new_local();
+
+    read_lane.submit(async move {
+        while let Ok(data) = input.receive().await {
+            raw_s.send(data).await?;
+        }
+    })?;
+
+    process_lane.submit(async move {
+        while let Ok(raw) = raw_r.receive().await {
+            proc_s.send(transform(raw).await).await?;
+        }
+    })?;
+
+    write_lane.submit(async move {
+        while let Ok(processed) = proc_r.receive().await {
+            output.send(processed).await?;
+        }
+    })?;
+
+    // All three stages proceed simultaneously when contexts available
+    // Reading, processing, writing overlap in time
+}
 ```
 
 ### Data Parallelism
 
-```
-DATA PARALLELISM:
+```rust
+async fn parallel_process<T, R>(
+    inputs: Vec<T>,
+    compute_fn: impl Fn(T) -> R + Clone + Send + 'static,
+) -> Vec<R> {
+    let (sender, receiver) = Channel::new_local();
+    let count = inputs.len();
 
-┌─────────────────────────────────────────────────────────────┐
-│                  DATA PARALLEL PATTERN                       │
-│                                                             │
-│  CONCEPT:                                                   │
-│  Split data into chunks.                                    │
-│  Process each chunk in separate lane.                       │
-│  Collect and combine results.                               │
-│                                                             │
-│  IMPLEMENTATION:                                            │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ async fn parallel_process(data: Vec<Data>) -> Vec<Result> {│
-│  │     let num_lanes = 4;                               │   │
-│  │     let chunk_size = data.len() / num_lanes;         │   │
-│  │                                                      │   │
-│  │     let (sender, receiver) = Channel::new_local();   │   │
-│  │                                                      │   │
-│  │     for i in 0..num_lanes {                          │   │
-│  │         let lane = Lane::create()?;                  │   │
-│  │         let chunk = data[i*chunk_size..(i+1)*chunk_size].to_vec();│
-│  │         let s = sender.clone();                       │   │
-│  │         lane.submit(async move {                     │   │
-│  │             let result = process_chunk(chunk).await; │   │
-│  │             s.send((i, result)).await                │   │
-│  │         })?;                                         │   │
-│  │     }                                                │   │
-│  │                                                      │   │
-│  │     // Collect all results                           │   │
-│  │     let mut results = vec![None; num_lanes];         │   │
-│  │     for _ in 0..num_lanes {                          │   │
-│  │         let (index, result) = receiver.receive().await?;│
-│  │         results[index] = Some(result);               │   │
-│  │     }                                                │   │
-│  │                                                      │   │
-│  │     results.into_iter().flatten().collect()          │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+    for (i, input) in inputs.into_iter().enumerate() {
+        let mut lane = Lane::create()?;
+        let s = sender.clone();
+        let f = compute_fn.clone();
 
-### Pipeline Processing
+        // On Compute with per-lane-weights: optionally set weight
+        #[cfg(feature = "per-lane-weights")]
+        // All equal for peer parallel computation
+        lane.set_weight(1)?;
 
-```
-PIPELINE PATTERN:
+        lane.submit(async move {
+            let result = f(input);
+            s.send((i, result)).await?;
+        })?;
+    }
 
-┌─────────────────────────────────────────────────────────────┐
-│                   PIPELINE PATTERN                           │
-│                                                             │
-│  CONCEPT:                                                   │
-│  Each processing stage in separate lane.                    │
-│  Stages proceed independently.                              │
-│  Overlapped execution for throughput.                       │
-│                                                             │
-│  IMPLEMENTATION:                                            │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ async fn pipeline(input: InputChannel) -> OutputChannel {│
-│  │     let read_lane = Lane::create()?;                 │   │
-│  │     let process_lane = Lane::create()?;              │   │
-│  │     let write_lane = Lane::create()?;                │   │
-│  │                                                      │   │
-│  │     // Channels between stages                       │   │
-│  │     let (raw_sender, raw_receiver) = Channel::new(); │   │
-│  │     let (proc_sender, proc_receiver) = Channel::new();│
-│  │                                                      │   │
-│  │     // Stage 1: Read                                 │   │
-│  │     read_lane.submit(async move {                    │   │
-│  │         while let Ok(data) = input.receive().await { │   │
-│  │             raw_sender.send(data).await;             │   │
-│  │         }                                            │   │
-│  │     })?;                                             │   │
-│  │                                                      │   │
-│  │     // Stage 2: Process                              │   │
-│  │     process_lane.submit(async move {                 │   │
-│  │         while let Ok(raw) = raw_receiver.receive().await {│
-│  │             let processed = transform(raw).await;    │   │
-│  │             proc_sender.send(processed).await;       │   │
-│  │         }                                            │   │
-│  │     })?;                                             │   │
-│  │                                                      │   │
-│  │     // Stage 3: Write                                │   │
-│  │     write_lane.submit(async move {                   │   │
-│  │         while let Ok(processed) = proc_receiver.receive().await {│
-│  │             output.send(processed).await;            │   │
-│  │         }                                            │   │
-│  │     })?;                                             │   │
-│  │                                                      │   │
-│  │     output                                            │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  BENEFIT:                                                   │
-│  Reading, processing, writing all happen simultaneously.    │
-│  When stage 2 is processing chunk N,                        │
-│  stage 1 can read chunk N+1,                                │
-│  stage 3 can write chunk N-1.                               │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Application-Controlled Resolution
-
-```
-RESOLUTION:
-
-┌─────────────────────────────────────────────────────────────┐
-│                 RESOLUTION CONTROL                           │
-│                                                             │
-│  QUANTUM COLLAPSE (Quantum Computing):                      │
-│  - Physics-imposed                                         │
-│  - Destroys unselected states                               │
-│  - Requires repeated runs                                   │
-│  - Information lost                                        │
-│                                                             │
-│  APPLICATION-CONTROLLED RESOLUTION (CIBOS):                 │
-│  - Application decides when                                │
-│  - Application decides how                                 │
-│  - All results preserved                                    │
-│  - One run sufficient                                      │
-│                                                             │
-│  EXAMPLE:                                                   │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // All lanes running                                │   │
-│  │ let lanes = create_lanes(4)?;                        │   │
-│  │ let results = collect_all(lanes).await?;             │   │
-│  │                                                      │   │
-│  │ // Application decides how to resolve                │   │
-│  │                                                      │   │
-│  │ // Option 1: Take first result                       │   │
-│  │ let first = results.into_iter().next()?;             │   │
-│  │                                                      │   │
-│  │ // Option 2: Take best result                        │   │
-│  │ let best = results.into_iter()                       │   │
-│  │     .max_by_key(|r| r.quality_score())?;             │   │
-│  │                                                      │   │
-│  │ // Option 3: Combine all results                     │   │
-│  │ let combined = combine_all(results);                 │   │
-│  │                                                      │   │
-│  │ // Option 4: Use all results                         │   │
-│  │ for result in results {                              │   │
-│  │     analyze(result);                                 │   │
-│  │ }                                                    │   │
-│  │                                                      │   │
-│  │ // No collapse - application controls resolution      │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+    // Collect ALL results — no collapse
+    let mut results = vec![None; count];
+    for _ in 0..count {
+        let (i, result) = receiver.receive().await?;
+        results[i] = Some(result);
+    }
+    results.into_iter().flatten().collect()
+}
 ```
 
 ---
 
-## Chapter 6: Per-Lane Weights (Compute Profile)
+## Chapter 6: Profile-Specific Application Design
 
-### When Per-Lane Weights Are Available
+### Maximum Isolation Applications
 
-Per-lane weights are only available when the `per-lane-weights` feature is compiled in (Compute Profile). In other profiles, all lanes use the container's weight class.
+Equal weights (1:1:1). Anti-starvation NOT compiled. Very long waits are theoretically possible under extreme load.
 
-### Assigning Weights
+**Design guidance:** Handle variable latency. Don't assume immediate dispatch. Use timeouts for time-sensitive operations. Design for correctness under any execution ordering. Anti-starvation guarantees are not available — design defensively.
 
-```
-PER-LANE WEIGHTS:
+### Balanced Applications
 
-┌─────────────────────────────────────────────────────────────┐
-│                  PER-LANE WEIGHTS                            │
-│                                                             │
-│  WHEN TO USE:                                               │
-│  - Application has internal priority                        │
-│  - Some computations more time-sensitive than others        │
-│  - User-facing vs background work                           │
-│                                                             │
-│  HOW TO ASSIGN:                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // High-priority main computation                    │   │
-│  │ let primary = Lane::create_with_weight(5)?;          │   │
-│  │                                                      │   │
-│  │ // Secondary support computation                     │   │
-│  │ let support = Lane::create_with_weight(2)?;          │   │
-│  │                                                      │   │
-│  │ // Background cleanup                                │   │
-│  │ let cleanup = Lane::create_with_weight(1)?;          │   │
-│  │                                                      │   │
-│  │ // With weights 5:2:1,                               │   │
-│  │ // Primary: 5/8 = 62.5% selection probability        │   │
-│  │ // Support: 2/8 = 25% selection probability          │   │
-│  │ // Cleanup: 1/8 = 12.5% selection probability        │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  WHEN NOT TO USE:                                           │
-│  - All lanes are peers                                      │
-│  - No internal priority                                     │
-│  - Equal weight is correct                                  │
-│                                                             │
-│  // All lanes equal - default                               │
-│  let lane = Lane::create()?; // Weight = container class    │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+System class has higher probability (weight 3 vs 1). Anti-starvation ensures progress (100ms threshold).
 
-### UI Lane Priority (Compute Profile)
+**Design guidance:** UI applications can expect more responsive dispatch. Standard patterns work well. Anti-starvation provides a backstop.
 
-In Compute profile, if interactive monitoring is needed:
+### Performance Applications
+
+Strong system class priority (weight 5). Anti-starvation (50ms). Full-fairness ensures proportional execution time. SMT enabled.
+
+**Design guidance:** UI components get strong priority. All containers eventually execute (full-fairness guarantees). Time-based triggering is fully appropriate.
+
+### Compute Applications
+
+Pure parallel computation with minimal overhead. Maximum quantum-like properties.
 
 ```rust
-// High-priority UI lane
-let ui_lane = Lane::create_with_weight(2)?;
+// Compute-optimized: maximum lanes, minimal overhead
+async fn compute_intensive(workload: Workload) -> Results {
+    let parallelism = determine_optimal_lanes(); // Based on workload + available contexts
+    let (sender, receiver) = Channel::new_local();
 
-// Standard compute lanes
-let compute_lane_1 = Lane::create_with_weight(1)?;
-let compute_lane_2 = Lane::create_with_weight(1)?;
+    for i in 0..parallelism {
+        let mut lane = Lane::create()?;
+        let work_unit = workload.chunk(i, parallelism);
+        let s = sender.clone();
 
-// UI lane selected 2x more often than each compute lane
-// Maintains responsiveness during computation
-```
+        // Use per-lane weights for phase-aware computation (Compute only)
+        #[cfg(feature = "per-lane-weights")]
+        lane.set_weight(1)?;  // All equal for peer computation
 
-This is weight-based prioritization, NOT time-based scheduling.
+        lane.submit(async move {
+            let result = compute(work_unit).await;
+            s.send((i, result)).await?;
+        })?;
+    }
 
----
+    let mut results = vec![None; parallelism];
+    for _ in 0..parallelism {
+        let (i, r) = receiver.receive().await?;
+        results[i] = Some(r);
+    }
+    results.into_iter().flatten().collect()
+}
 
-## Chapter 7: Error Handling
+// Dynamic weight phase management (Compute only)
+#[cfg(feature = "dynamic-weights")]
+async fn phased_computation(
+    data_lane: &Lane,
+    compute_lanes: &[Lane],
+    result_lane: &Lane,
+) {
+    // Phase 1: Load data (prioritize data lane)
+    data_lane.update_weight(5)?;
+    for l in compute_lanes { l.update_weight(1)?; }
+    result_lane.update_weight(1)?;
+    data_lane.submit(load_data()).await?;
 
-### Stall Handling
+    // Phase 2: Parallel computation (all equal)
+    data_lane.update_weight(1)?;
+    for l in compute_lanes { l.update_weight(1)?; }
+    // ... submit compute work ...
 
-```
-STALL HANDLING:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    STALL HANDLING                            │
-│                                                             │
-│  WHAT STALL MEANS:                                          │
-│  - Operation cannot proceed                                 │
-│  - Kernel is waiting for resource                           │
-│  - NOT an error                                             │
-│  - Will resume when resource available                      │
-│                                                             │
-│  APPLICATION BEHAVIOR:                                       │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Don't detect or handle stalls                     │   │
-│  │ // Let the kernel manage them                        │   │
-│  │                                                      │   │
-│  │ // Stalls are transparent                           │   │
-│  │ async fn process() {                                 │   │
-│  │     // This may stall if memory unavailable          │   │
-│  │     let data = allocate(size).await?;                │   │
-│  │                                                      │   │
-│  │     // This may stall if channel full               │   │
-│  │     channel.send(message).await?;                    │   │
-│  │                                                      │   │
-│  │     // No retry, no polling                             │   │
-│  │     // Kernel will resume when resources available       │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Resource Exhaustion
-
-```
-RESOURCE EXHAUSTION:
-
-┌─────────────────────────────────────────────────────────────┐
-│                 RESOURCE EXHAUSTION                          │
-│                                                             │
-│  MEMORY EXHAUSTION:                                         │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // If you need to detect before stall               │   │
-│  │ let available = container.memory_available();       │   │
-│  │                                                      │   │
-│  │ if size > available {                                │   │
-│  │     // Handle before attempting allocation          │   │
-│  │     reduce_working_set();                            │   │
-│  │ } else {                                             │   │
-│  │     let data = allocate(size).await?;                │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  CHANNEL EXHAUSTION:                                         │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Channel buffer full - send stalls                 │   │
-│  │ // This is normal flow control                       │   │
-│  │ channel.send(message).await?;                        │   │
-│  │                                                      │   │
-│  │ // If you need to avoid stall                        │   │
-│  │ if channel.buffer_space() > 0 {                      │   │
-│  │     channel.send(message).await?;                    │   │
-│  │ } else {                                             │   │
-│  │     // Buffer full, do other work                    │   │
-│  │     handle_backpressure();                            │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Graceful Degradation
-
-```
-GRACEFUL DEGRADATION:
-
-┌─────────────────────────────────────────────────────────────┐
-│                GRACEFUL DEGRADATION                          │
-│                                                             │
-│  UNDER PRESSURE:                                            │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ async fn process_with_fallback() {                  │   │
-│  │     let resources = container.resource_state();     │   │
-│  │                                                      │   │
-│  │     if resources.memory_available > threshold {      │   │
-│  │         // Full quality processing                   │   │
-│  │         full_quality_process().await                 │   │
-│  │     } else {                                         │   │
-│  │         // Reduced quality, less memory              │   │
-│  │         degraded_process().await                     │   │
-│  │     }                                                │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  WITH TIMEOUTS:                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Application-level timeout                         │   │
-│  │ match timeout(Duration::from_secs(30), operation()).await {│
-│  │     Ok(result) => handle(result),                   │   │
-│  │     Err(Timeout) => {                               │   │
-│  │         // Operation timed out                       │   │
-│  │         // May still be pending                      │   │
-│  │         fallback_approach();                         │   │
-│  │     }                                               │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Application Crashes
-
-If your application crashes (panic, illegal memory access, unhandled error), the kernel isolates the crash to your container. Other applications continue running. Design for graceful degradation:
-- Handle errors explicitly rather than panicking
-- Log errors to your application's storage before they become fatal
-- Implement restart logic that recovers from partial state
-
----
-
-## Chapter 8: Debugging
-
-### Observing Execution
-
-```
-DEBUGGING:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    DEBUGGING                                 │
-│                                                             │
-│  ADD OBSERVABILITY:                                         │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Add logging at key points                        │   │
-│  │ log::debug!("Lane {} starting task", lane.id());    │   │
-│  │                                                      │   │
-│  │ // Check resource state                              │   │
-│  │ let state = container.get_resource_state();         │   │
-│  │ log::debug!("Memory: {} / {}",                       │   │
-│  │     state.memory_used,                              │   │
-│  │     state.memory_limit                              │   │
-│  │ );                                                   │   │
-│  │                                                      │   │
-│  │ // Log channel state                                 │   │
-│  │ log::debug!("Channel {} pending: {}",                │   │
-│  │     channel.id(),                                   │   │
-│  │     channel.pending_messages()                       │   │
-│  │ );                                                   │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  DETECT STALLS:                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Add stall detection                              │   │
-│  │ async fn detect_stall() {                            │   │
-│  │     let start = Instant::now();                      │   │
-│  │     let result = operation().await;                  │   │
-│  │     let duration = start.elapsed();                  │   │
-│  │                                                      │   │
-│  │     if duration > Duration::from_secs(1) {           │   │
-│  │         log::warn!("Long wait: {:?}", duration);    │   │
-│  │     }                                                │   │
-│  │                                                      │   │
-│  │     result                                            │   │
-│  │ }                                                    │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Performance Analysis
-
-```
-PERFORMANCE:
-
-┌─────────────────────────────────────────────────────────────┐
-│                  PERFORMANCE ANALYSIS                        │
-│                                                             │
-│  MEASURE THROUGHPUT:                                        │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ let start = Instant::now();                          │   │
-│  │ let count = process_batch().await?;                  │   │
-│  │ let duration = start.elapsed();                       │   │
-│  │ let throughput = count as f64 / duration.as_secs_f64();│
-│  │ log::info!("Throughput: {:.2} ops/sec", throughput); │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  MEASURE LATENCY:                                           │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ let start = Instant::now();                          │   │
-│  │ let result = operation().await?;                      │   │
-│  │ let latency = start.elapsed();                        │   │
-│  │ log::info!("Latency: {:?}", latency);                 │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  TRACK RESOURCE USAGE:                                      │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ let before = container.memory_used();                │   │
-│  │ process().await?;                                    │   │
-│  │ let after = container.memory_used();                 │   │
-│  │ log::debug!("Memory delta: {} bytes", after - before);│
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Common Pitfalls
-
-```
-PITFALLS:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    COMMON PITFALLS                           │
-│                                                             │
-│  1. ASSUMING ORDERING                                       │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Wrong: Assume lanes execute in order              │   │
-│  │ lane1.submit(task1)?;                                │   │
-│  │ lane2.submit(task2)?;                                │   │
-│  │ // task1 may execute after task2                     │   │
-│  │                                                      │   │
-│  │ // Right: Use channels for ordering                  │   │
-│  │ lane1.submit(task1_then_send_to(channel))?;          │   │
-│  │ lane2.submit(wait_for_channel_then_task2(channel))?; │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  2. SPIN-WAITING                                            │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Wrong: Spin-wait                                  │   │
-│  │ while !resource_available() {                        │   │
-│  │     // Don't do this                                 │   │
-│  │ }                                                    │   │
-│  │                                                      │   │
-│  │ // Right: Event-driven                              │   │
-│  │ wait_for_resource().await?;                          │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  3. HOLDING RESOURCES                                       │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ // Wrong: Hold resource for entire operation         │   │
-│  │ let lock = acquire();                                │   │
-│  │ do_everything();                                     │   │
-│  │ release(lock);                                       │   │
-│  │                                                      │   │
-│  │ // Right: Release promptly                          │   │
-│  │ let resource = acquire().await?;                     │   │
-│  │ let data = read(resource);                           │   │
-│  │ release(resource);                                   │   │
-│  │ process(data);                                       │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+    // Phase 3: Collect results (prioritize result lane)
+    result_lane.update_weight(5)?;
+    // ... collect ...
+}
 ```
 
 ---
 
-## Chapter 9: Security Considerations for Application Developers
+## Chapter 7: Event-Driven UI Design
 
-### What Isolation Provides
-
-Your application's memory is private by architecture. Your application's execution timing is not observable by other applications. Your communication is through explicitly established channels that you control.
-
-### What Applications Still Need to Handle
-
-**Channel-borne data:** Messages received on channels come from the other application. Validate all input received through channels.
-
-**File system data:** Data read from storage was written at some prior time. Validate stored data on read.
-
-**External data:** Any data entering your application from outside must be treated as potentially malformed.
-
----
-
-## Chapter 10: Compute Profile Specifics
-
-### Lightweight Handshake Communication
-
-Compute profile uses lightweight handshake IPC. Channel establishment verifies identity once. Subsequent messages flow without per-message cryptographic overhead. This is not a security compromise in an air-gapped, single-user environment.
-
-Application code is identical regardless of IPC mode — the system configuration determines which mode is in use.
-
-### No RTRO
-
-Compute profile has no RTRO. System metrics (CPU usage, memory usage, event timing) are accurate. This is beneficial for performance analysis and workload monitoring.
-
-### Maximum Computation Throughput
-
-The combination of:
-- Equal weights (or per-lane weights) maximizing selection fairness
-- No RTRO overhead
-- Lightweight handshake (no per-message cryptographic overhead)
-- SMT enabled (maximum execution contexts)
-- Anti-starvation optional (minimal or no overhead)
-
-...makes Compute profile the highest-throughput configuration for parallel computation workloads.
-
----
-
-## Chapter 11: Event-Driven UI Design
-
-Traditional UI assumes guaranteed frame times (e.g., 60 FPS = 16ms per frame). CIBOS's entropy-based dispatch does not guarantee latency.
-
-### Adapting UI to CIBOS
-
-**Pattern: State Buffering**
-
-Maintain a state buffer that accumulates changes:
-
-1. Input events update state buffer (fast, no rendering)
-2. When UI lane is selected:
-   - Read current state from buffer
-   - Render single frame
-3. State buffer is overwritten, not appended (memory bounded)
-
-**Example:**
+Traditional UI assumes guaranteed frame times. CIBOS's entropy-based dispatch does not guarantee fixed latency. Adapt with state buffering:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                 STATE BUFFER PATTERN                        │
-│                                                             │
-│  UI Container:                                              │
-│                                                             │
-│  State Buffer (memory bounded):                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ Element 1: position=(15, 25), color=red            │   │
-│  │ Element 2: position=(100, 200), visible=true       │   │
-│  │ Element 3: text="Hello", font=mono                 │   │
-│  │ ...                                                │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  Event: Mouse move                                         │
-│    → Update state buffer (position: 15, 25 → 17, 27)       │
-│                                                             │
-│  Event: Mouse move                                         │
-│    → Update state buffer (position: 17, 27 → 19, 29)       │
-│                                                             │
-│  [Entropy selects UI lane]                                  │
-│  Event: UI lane runs                                       │
-│    → Read state buffer (latest: 19, 29)                     │
-│    → Render frame                                          │
-│                                                             │
-│  Result: One render for multiple input events              │
-│          Responsive feel from high throughput              │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+STATE BUFFER PATTERN:
+
+Instead of:
+  loop { render_frame(); sleep(16ms); }  // WRONG — doesn't work
+
+Use:
+  Lane collects input events → updates state buffer
+  When lane is dispatched → renders current state
 ```
-
-### Memory Costs of UI State Buffering
-
-State buffer memory is bounded by UI complexity:
-
-```
-Per UI element:
-  Position: 2 × f32 = 8 bytes
-  Color: 4 × u8 = 4 bytes
-  Visibility: 1 × bool = 1 byte
-  Other state: ~16 bytes
-  Total per element: ~32 bytes
-
-For 1000 UI elements:
-  State buffer: ~32 KB
-
-Memory cost is acceptable for typical UI complexity.
-```
-
-### Preloading vs Batching
-
-**Preloading:** Loading assets before first use
-- Images, fonts, sounds
-- Reduces latency when assets first needed
-- Separate from batching
-
-**Batching:** Accumulating state changes before rendering
-- Reduces render calls
-- Aligns with entropy-based dispatch
-- Different from preloading
-
-Both are valid optimizations. Neither breaks isolation.
-
-### Weight Classes for UI Responsiveness
-
-In Balanced and Performance profiles, UI containers are system class:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                 UI CLASS ASSIGNMENT                          │
-│                                                             │
-│  I/O Container (system class):                              │
-│    - Receives mouse, keyboard input                         │
-│    - Higher selection probability                           │
-│    → UI container via channel                              │
-│                                                             │
-│  UI Container (system class):                               │
-│    - Receives input from I/O container                      │
-│    - Higher selection probability                           │
-│    - State buffer → render when selected                    │
-│                                                             │
-│  No "hardware class" needed                                 │
-│  System class already provides appropriate priority          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### What NOT to Do
-
-**Do NOT reintroduce time-based scheduling:**
-- No frame time guarantees
-- No priority boosting based on wall-clock time
-- No timer-driven rendering
-
-**Do NOT assume immediate execution:**
-- UI may not run every 16ms
-- Design for throughput, not latency
-- Accumulate state, render when selected
-
-**Do NOT spin or poll:**
-- No polling for "is it time to render"
-- No busy-wait for frame deadlines
-- Use event-driven patterns only
-
----
-
-## Chapter 12: Sensor Access for Mobile Applications
-
-CIBOS-MOBILE provides complete sensor isolation. Each sensor is an isolated resource requiring per-access authorization.
-
-### Sensor Access Pattern
-
-**Request sensor access:**
 
 ```rust
-// Request camera access
+// State buffer accumulates changes between dispatches
+struct UIState {
+    elements: HashMap<ElementId, ElementState>,
+    needs_render: bool,
+}
+
+let mut lane = Lane::create()?;
+lane.submit(async move {
+    loop {
+        let event = input_or_timer.receive().await?;
+        state.update(event);
+        if state.needs_render {
+            render(state.snapshot());
+            state.needs_render = false;
+        }
+    }
+})?;
+```
+
+**Benefits:** Multiple input events handled between renders. No stale renders. Memory bounded. Works on all profiles.
+
+**What NOT to do:**
+
+```rust
+// WRONG — assumes fixed frame times
+loop {
+    render_frame();
+    Timer::sleep(Duration::from_millis(16)).await;  // "60 FPS" — unreliable
+}
+
+// WRONG — polling for dispatch time
+while !time_to_render() { /* spinning — breaks the model */ }
+
+// WRONG — standard Tokio primitives
+tokio::spawn(async { /* global task queue with locks */ });
+```
+
+**System class for UI responsiveness:** On Balanced and Performance profiles, UI containers are system class with higher weight — they receive more selection probability when competition exists. On Maximum Isolation (equal weights), design for variable latency.
+
+---
+
+## Chapter 8: Sensor Access for Mobile Applications (CIBOS-MOBILE)
+
+CIBOS-MOBILE provides complete sensor isolation. Each sensor requires per-access authorization.
+
+```rust
+// Request camera access (user sees authorization prompt)
 let camera = Sensor::request(SensorType::Camera).await?;
+// If denied → error returned; if approved → isolated channel established
 
-// User sees authorization prompt
-// If approved, camera channel established
-// If denied, error returned
-```
-
-**Use sensor:**
-
-```rust
-// Read camera frame
+// Read frame (sensor data isolated to this container)
 let frame = camera.read_frame().await?;
-
-// Process frame
 process_image(frame);
 
-// Camera data never leaves container
-```
-
-**Release sensor:**
-
-```rust
 // Release when done
 camera.release();
 ```
 
-### Per-Access Authorization
-
-**Every sensor access requires fresh authorization:**
-
-```
-SENSOR AUTHORIZATION FLOW:
-
-1. Container requests sensor access
-   ↓
-2. Kernel sends authorization request to user
-   ↓
-3. User approves or denies
-   ↓
-4. If approved:
-   - Isolated channel established
-   - Sensor data flows only to requesting container
-   - System indicator shows sensor in use
-   ↓
-5. When container releases sensor:
-   - Channel closed
-   - Sensor no longer accessible
-   - System indicator clears
-```
-
-### Camera Isolation
-
-```
-CAMERA ISOLATION:
-
-┌─────────────────────────────────────────────────────────────┐
-│                    CAMERA ISOLATION                          │
-│                                                             │
-│  Camera is an isolated resource:                            │
-│                                                             │
-│  - Only one container can access at a time                  │
-│  - Per-access authorization required                       │
-│  - Camera data never shared between containers             │
-│  - System indicator when camera active                      │
-│                                                             │
-│  Request:                                                   │
-│    let camera = Sensor::request(SensorType::Camera).await?; │
-│                                                             │
-│  Capture:                                                   │
-│    let frame = camera.read_frame().await?;                  │
-│                                                             │
-│  Release:                                                   │
-│    camera.release();                                        │
-│                                                             │
-│  Multiple requests:                                         │
-│    - Second request blocked until first released           │
-│    - No cross-container observation                        │
-│    - No timing channel from camera access                   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Microphone Isolation
-
-```
-MICROPHONE ISOLATION:
-
-┌─────────────────────────────────────────────────────────────┐
-│                  MICROPHONE ISOLATION                        │
-│                                                             │
-│  Microphone is an isolated resource:                       │
-│                                                             │
-│  - Per-access authorization required                       │
-│  - Recording indicator visible system-wide                 │
-│  - Audio data never shared between containers             │
-│                                                             │
-│  Request:                                                   │
-│    let mic = Sensor::request(SensorType::Microphone).await?;│
-│                                                             │
-│  Record:                                                    │
-│    let audio = mic.read_samples().await?;                  │
-│                                                             │
-│  Release:                                                   │
-│    mic.release();                                           │
-│                                                             │
-│  Recording indicator:                                       │
-│    - Shows in system UI when active                        │
-│    - User can see which container recording                │
-│    - User can revoke access at any time                    │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### GPS Isolation
-
-```
-GPS ISOLATION:
-
-┌─────────────────────────────────────────────────────────────┐
-│                      GPS ISOLATION                           │
-│                                                             │
-│  GPS is an isolated resource:                               │
-│                                                             │
-│  - Per-access authorization required                       │
-│  - Precision level selectable (coarse or fine)             │
-│  - Location data isolated to requesting container          │
-│  - Location history per-container                          │
-│                                                             │
-│  Request (coarse):                                         │
-│    let gps = Sensor::request(SensorType::Gps)              │
-│        .precision(Precision::Coarse)                        │
-│        .await?;                                             │
-│                                                             │
-│  Request (fine):                                            │
-│    let gps = Sensor::request(SensorType::Gps)              │
-│        .precision(Precision::Fine)                          │
-│        .await?;                                             │
-│                                                             │
-│  Read:                                                      │
-│    let location = gps.read_location().await?;               │
-│                                                             │
-│  Precision levels:                                          │
-│    Coarse: ~500m accuracy (privacy-preserving)             │
-│    Fine: ~10m accuracy (requires explicit approval)        │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Other Sensors
-
-All other sensors follow the same isolation pattern:
-
-- Accelerometer
-- Gyroscope
-- Magnetometer
-- Proximity
-- Ambient light
-- Barometer
-- etc.
-
-Each requires per-access authorization and provides complete data isolation.
+**Sensor properties:**
+- Camera: Per-access authorization, single-container access, system indicator active
+- Microphone: Per-access authorization, recording indicator system-wide, audio data isolated
+- GPS: Per-access authorization, coarse or fine precision option, location data isolated
+- All other sensors: Same pattern — per-access, isolated data
 
 ---
 
-## Chapter 13: Application State and Persistence
+## Chapter 9: Error Handling
 
-### Your Isolation Boundary
+### Stalls Are Not Errors
 
-Your container's memory is private by architecture. No other application can read or write it. All shared state with other applications must go through channels.
+A stall is a container waiting for a resource. It is NOT an error. No retry is needed. The container resumes automatically.
 
-### Persistent State
+```rust
+// This is CORRECT — .await stalls if empty, resumes when data arrives
+let message = channel.receive().await?;
+// The '?' propagates actual errors (channel closed, etc.)
+// NOT stalls — stalls are transparent
+```
 
-Applications can write persistent state to storage through the file system interface. Each application sees only its authorized file system region. Storage access goes through the kernel's I/O system and may cause stalls.
+### Application Crashes
 
-### State Across Application Restart
+If your application panics, the crash is isolated to your container. Other containers continue. Design for graceful degradation: handle errors explicitly, checkpoint state for long-running computations, check for and resume from checkpoints on restart.
 
-When your container restarts (crash or intentional restart), memory state is lost. Design for graceful restarts:
-- Write checkpoints to storage periodically for long-running computations
-- On startup, check for a checkpoint and resume from it if found
-- Handle the case where no checkpoint exists (fresh start)
+---
+
+## Chapter 10: Debugging
+
+```rust
+// Log at key points
+log::debug!("Lane {} starting task", lane.id());
+
+// Check resource state
+let state = container.get_resource_state();
+log::debug!("Memory: {} / {}", state.memory_used, state.memory_limit);
+
+// Detect long waits
+async fn detect_slow<F, T>(op: F) -> T where F: Future<Output = T> {
+    let start = Instant::now();
+    let result = op.await;
+    let duration = start.elapsed();
+    if duration > Duration::from_secs(1) {
+        log::warn!("Long wait: {:?}", duration);
+    }
+    result
+}
+
+// Measure throughput
+let start = Instant::now();
+let count = process_batch().await?;
+let throughput = count as f64 / start.elapsed().as_secs_f64();
+log::info!("Throughput: {:.2} ops/sec", throughput);
+```
+
+---
+
+## Chapter 11: Common Pitfalls
+
+```rust
+// PITFALL 1: Assuming cross-lane ordering
+lane1.submit(task1)?;
+lane2.submit(task2)?;
+// task2 MAY execute before task1 — entropy-based dispatch
+
+// SOLUTION: Channels for explicit dependencies
+lane1.submit(compute_then_send_to(channel))?;
+lane2.submit(wait_for_channel_then_compute(channel))?;
+
+// PITFALL 2: Spin-waiting
+while !resource_available() { }  // NEVER — breaks the model
+
+// SOLUTION: Await the resource
+wait_for_resource().await?;
+
+// PITFALL 3: Using Tokio primitives
+tokio::spawn(async { ... });     // NEVER — global locks
+tokio::sync::Mutex::new(data);   // NEVER — global locks
+
+// SOLUTION: Use CIBOS primitives
+Lane::create()?.submit(async { ... })?;
+// Use channels for communication, not shared state
+
+// PITFALL 4: Holding resources while doing other work
+let resource = acquire_exclusive().await?;
+do_unrelated_work().await?;  // Resource held unnecessarily
+
+// SOLUTION: Minimal resource hold time
+let data = {
+    let resource = acquire().await?;
+    let d = read(resource);
+    release(resource).await?;
+    d
+};
+process(data).await?;  // Process without holding resource
+
+// PITFALL 5: Assuming fixed dispatch timing
+loop {
+    render_frame();
+    Timer::sleep(Duration::from_millis(16)).await;  // Unreliable
+}
+
+// SOLUTION: Event-driven rendering
+state.update(event);
+if state.changed() { render(state.snapshot()); }
+```
 
 ---
 
@@ -1589,26 +685,27 @@ When your container restarts (crash or intentional restart), memory state is los
 
 ### Lane Operations
 
-| Operation | Description |
-|---|---|
-| `Lane::create()` | Create lane with container's weight class |
-| `Lane::create_with_weight(n)` | Create lane with explicit weight (Compute profile) |
-| `lane.submit(future)` | Submit async event to lane |
-| `lane.destroy()` | Destroy lane after current event completes |
-| `lane.destroy_immediate()` | Destroy lane immediately, cancel pending events |
+| Operation | Description | Profile Restriction |
+|---|---|---|
+| `Lane::create()` | Create lane with container class weight | All profiles |
+| `Lane::create_with_weight(n)` | Create lane with explicit weight | per-lane-weights only |
+| `lane.update_weight(n)` | Update weight at runtime via message | dynamic-weights only |
+| `lane.submit(future)` | Submit async event (FIFO in this lane) | All profiles |
+| `lane.destroy()` | Graceful destroy (waits for current event) | All profiles |
+| `lane.destroy_immediate()` | Immediate destroy, cancel pending | All profiles |
 
 ### Channel Operations
 
 | Operation | Description |
 |---|---|
-| `Channel::request(request)` | Request channel (awaits acceptance) |
-| `container.await_channel_request()` | Wait for incoming request |
+| `Channel::request(req).await` | Request channel (awaits acceptance) |
+| `container.await_channel_request().await` | Wait for incoming request |
 | `incoming.accept()` | Accept all proposed terms |
 | `incoming.reject()` | Reject the request |
-| `channel.send(data).await` | Send message (stalls if buffer full) |
-| `channel.receive().await` | Receive message (stalls if buffer empty) |
+| `channel.send(data).await` | Send (stalls if buffer full) |
+| `channel.receive().await` | Receive (stalls if buffer empty) |
 | `channel.try_receive()` | Non-blocking receive |
-| `channel.close()` | Close the channel |
+| `channel.close()` | Close channel |
 
 ### Timer Operations
 
@@ -1618,15 +715,7 @@ When your container restarts (crash or intentional restart), memory state is los
 | `Timer::at(instant).await` | Sleep until specified instant |
 | `with_timeout(duration, future).await` | Run future with timeout |
 
-### Resource Query
-
-| Operation | Description |
-|---|---|
-| `container.memory_usage()` | Current memory usage |
-| `container.memory_limit()` | Memory limit for this container |
-| `container.channel_count()` | Number of active channels |
-
-### Sensor Operations
+### Sensor Operations (CIBOS-MOBILE)
 
 | Operation | Description |
 |---|---|
@@ -1634,8 +723,8 @@ When your container restarts (crash or intentional restart), memory state is los
 | `sensor.read_frame().await` | Read camera frame |
 | `sensor.read_samples().await` | Read microphone samples |
 | `sensor.read_location().await` | Read GPS location |
-| `sensor.release()` | Release sensor |
+| `sensor.release()` | Release sensor access |
 
 ---
 
-*This Application Developer Guide covers writing applications for CIBOS. For system implementation details, see the Developer Guide. For deployment configuration, see the Administrator Guide.*
+*For system implementation details, see the Developer Guide. For deployment, see the Administrator Guide. For the async runtime internals, see the CIBOS Async Runtime Guide.*
