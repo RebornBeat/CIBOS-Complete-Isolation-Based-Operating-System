@@ -687,6 +687,45 @@ HIP-native hardware:
 
 Catch and Release at hardware speed — cycles, not microseconds. No software involvement for the eligibility determination.
 
+**Hardware Signal Coalescence:**
+
+Current software implementation processes signals in ~125 cycles per signal when coalesced. HIP-native hardware can reduce this to single-digit cycles:
+
+- DMA engine collects resource signals directly
+- Hardware buffer accumulates signals
+- Configurable threshold or timer triggers batch notification
+- Single interrupt to selector for entire batch
+
+Expected improvement: 10-50x reduction in signal processing overhead
+
+Importantly, hardware signal coalescence remains **opportunistic**:
+- No waiting for more signals
+- No artificial delays
+- Processes what has arrived, when it arrives
+- Hardware-level batching of natural signal bursts
+
+The threshold feature maps to a hardware register providing a backstop:
+- Register holds threshold duration
+- Hardware tracks oldest signal age
+- When threshold exceeded, immediate interrupt regardless of batch size
+- Same principle as software threshold but nanosecond precision
+
+This eliminates the software loop entirely. Signal processing becomes a single interrupt with batch payload, processed in microseconds rather than per-signal overhead.
+
+Hardware can also share timing infrastructure between signal threshold and anti-starvation, just as software does when both features are compiled.
+
+**Hardware Sensor Isolation:**
+
+For mobile variants, sensor isolation can be implemented in hardware:
+
+- Each sensor has dedicated isolated channel
+- Hardware-enforced per-access authorization
+- No software involvement in sensor data routing
+- Camera/microphone indicators in hardware
+- Sensor data never crosses container boundaries in hardware
+
+This extends the isolation-first architecture to sensors natively, eliminating the software overhead of sensor isolation entirely.
+
 ### 7.3 Non-Binary Substrate Opportunities
 
 Non-binary substrates — event-analog, analog, or other designs — can encode state as continuous values, probabilistic distributions, or event-streams rather than binary states.
@@ -716,6 +755,8 @@ HIP's software architecture would have a hardware twin — not an approximation,
 - Isolation-native execution context design
 - Hardware entropy selector specification
 - Hardware Catch and Release specification
+- Hardware signal coalescence specification
+- Hardware sensor isolation specification
 - Simulation models
 
 **Phase 2: Simulation and Emulation (2-4 years)**
