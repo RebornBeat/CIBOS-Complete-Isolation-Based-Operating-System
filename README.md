@@ -43,74 +43,96 @@ This elimination of global locks removes the root cause of timing side channels 
 
 ---
 
-## Catch and Release: The Core Execution Mechanism
+## The Two-Layer Execution Model
 
-Catch and Release is the kernel-level execution gating that makes the no-global-locks architecture function. It is not a component of CIBOS — it is the fundamental execution model.
+### Layer 1: Catch and Release — Determines What CAN Run
+
+**Purpose:** Determine which events have all required resources and are eligible to execute.
+
+**Process:**
+1. Monitor resource availability
+2. When any resource availability changes:
+   - Find containers in Stalled List waiting for this resource
+   - For each: verify ALL required resources are now available
+   - Move only fully-qualified containers to Ready Pool
+3. Ready Pool = Events that CAN execute now
+
+**Output:** Set of events with all required resources. This layer determines eligibility only — it has no concept of how many will run simultaneously.
+
+### Layer 2: Dispatch — Determines What RUNS NOW
+
+**Purpose:** Determine which eligible events actually execute.
+
+**Process:**
+1. Count events in Ready Pool: N
+2. Count available execution contexts (physical cores × SMT factor): C
+
+**IF N ≤ C (no competition):**
+- All N events dispatch simultaneously
+- Weighted entropy is NOT used
+- All ready events execute without selection
+
+**IF N > C (competition exists):**
+- Only C events can run simultaneously
+- Weighted entropy selects which C events are dispatched
+- Remaining N-C events stay in Ready Pool (not stalled, still eligible)
+
+Dispatch is triggered by resource availability changes and execution context availability, not by fixed time intervals.
+
+---
+
+## Catch and Release: The Core Execution Mechanism
 
 ### The Mechanism
 
-**Traditional lock-based execution:**
-A thread wants a resource, tries to acquire the lock, blocks if unavailable, waits in a lock queue observable by timing analysis, eventually executes. Every step creates observable signals.
+**Traditional lock-based system:**
+A thread wants a resource, tries to acquire the lock, blocks if unavailable, enters an observable lock queue, eventually executes. Every step creates observable signals.
 
 **Catch and Release:**
-A container has work to do. The kernel checks resource availability. If available, the container's event enters the Ready Pool and competes for execution through weighted entropy. If unavailable, the container enters the Stalled List, invisible and silent. When resources become available, the kernel moves the container to the Ready Pool. The container never spins, never polls, never retries. There is nothing to observe.
+A container has work to do. The kernel checks resource availability. If available, the container's event enters the Ready Pool. If unavailable, the container enters the Stalled List and waits invisibly. When resources become available, the kernel verifies ALL required resources are available for each waiting container and moves only qualified containers to the Ready Pool. The container never spins, never polls, never retries. There is nothing to observe.
 
 ### The Ready Pool
 
-The Ready Pool contains head events from active lanes whose required resources are currently available. An event in the Ready Pool can execute right now — it is waiting for selection, not for resources.
+The Ready Pool contains head events from active lanes whose required resources are currently available.
 
 **Events enter the Ready Pool when:**
 - New work is created with all required resources available
-- A resource becomes available for a stalled container
+- A resource becomes available and a stalled container now has ALL required resources
 
 **Events stay in the Ready Pool when:**
-- They are not selected in the current cycle — not being selected means the event is ready but not yet chosen; it remains in the Ready Pool competing for the next selection
+- They are not dispatched during a dispatch opportunity — they remain ready, not stalled
 
 **Events leave the Ready Pool when:**
-- Selected for execution
-- A resource they need is externally revoked (rare)
+- Dispatched for execution
+- A resource is externally revoked (rare)
 
 ### The Stalled List
 
-The Stalled List contains containers that cannot currently execute because a required resource is unavailable. It is a dependency tracking structure, not a queue. There is no ordering within the Stalled List relevant to future selection.
+The Stalled List contains containers that cannot currently execute. It is a dependency tracking structure with no ordering relevant to future selection.
 
 **Entries enter the Stalled List when:**
-- A container begins executing (having been selected from the Ready Pool) and encounters a resource constraint
+- A container begins executing (having been dispatched) and encounters a resource constraint
 
 **Entries leave the Stalled List when:**
-- The required resource becomes available, the kernel emits a signal, and moves the container to the Ready Pool
+- ALL required resources become available, the kernel verifies this, and moves the container to the Ready Pool
 
 ### Container State Machine
 
-| State | Description | Competing for Selection? |
+| State | Description | Eligible for Dispatch? |
 |---|---|---|
 | INACTIVE | No pending work | No |
-| READY | Head event in Ready Pool, resources available | Yes |
-| EXECUTING | Running on an execution core | Not yet |
+| READY | Head event in Ready Pool, all resources available | Yes |
+| EXECUTING | Running on an execution context | No (already running) |
 | STALLED | In Stalled List, waiting for a resource | No |
 
 **Transitions:**
 - INACTIVE → READY: New work created, resources available
 - INACTIVE → STALLED: New work created, resource unavailable
-- READY → EXECUTING: Selected by weighted entropy
+- READY → EXECUTING: Dispatched
 - EXECUTING → READY: Completes, next event in lane is ready
 - EXECUTING → STALLED: Resource needed but unavailable during execution
 - EXECUTING → INACTIVE: Completes, no further work
-- STALLED → READY: Required resource becomes available, kernel moves container to Ready Pool
-
-### What the Kernel Tracks
-
-The kernel's selector maintains:
-- The Ready Pool with all head events and their weights
-- The Stalled List mapping containers to the resources they are waiting for
-- Resource availability state for all resource types
-- Available execution core tracking
-
-The kernel does not maintain:
-- Queue depth within any lane
-- Events behind the head in any lane's internal queue
-- Ordering history between events
-- Information about what computation a lane is performing
+- STALLED → READY: ALL required resources become available, kernel moves container
 
 ### No Observable Retry
 
@@ -120,27 +142,28 @@ An application that needs a resource does not loop checking availability. It req
 
 ## Weighted Entropy Scheduling
 
-Weighted entropy selection is the kernel's mechanism for choosing which ready event executes next. It is the single scheduling mechanism across all CIBOS profiles, configured differently per profile through weights and optional feature compilation.
+Weighted entropy selection is the kernel's conflict resolution mechanism. It is used ONLY when more events are ready than execution contexts are available.
+
+### When Weighted Entropy Applies
+
+**Weighted entropy is for CONFLICT RESOLUTION, not for all dispatch.**
+
+- **No competition:** Dispatch all ready events. No selection needed.
+- **Competition exists:** Use weighted entropy to select which events dispatch.
 
 ### The Ticket Analogy
 
-Each event in the Ready Pool has tickets equal to its weight. The kernel selects one ticket uniformly at random using cryptographic entropy. An event with weight 3 has three tickets. An event with weight 1 has one ticket.
+Each event in the Ready Pool has tickets equal to its weight. When conflict resolution is needed, the kernel selects one ticket uniformly at random using cryptographic entropy.
 
-Example: One system event (weight 3) competing with three user events (weight 1 each). Pool contains 6 tickets. System event probability: 3/6 = 50%. Each user event probability: 1/6 ≈ 17%.
+Example: One system event (weight 3) competing with three user events (weight 1 each) for one slot. Pool contains 6 tickets. System event probability: 3/6 = 50%. Each user event probability: 1/6 ≈ 17%.
 
-Selection remains entropy-based. Weights skew probability without introducing determinism. No event is guaranteed to be selected or not selected.
+Selection remains entropy-based. Weights skew probability without introducing determinism.
 
 ### Weight Configuration
 
-Weights are boot-time configuration, loaded from a signed configuration file at startup. If no valid signed configuration is present, compiled defaults apply. Weights do not change during operation — configuration is read-only after boot.
+Weights are boot-time configuration, loaded from a signed configuration file at startup. Weights do not change during operation.
 
-**System class:** Components whose responsiveness directly affects user experience. Window managers, input handlers, compositors, audio servers.
-
-**User class:** Standard application containers.
-
-**Background class:** Non-critical background processes.
-
-Weight values per profile (compiled defaults, overridable via signed config):
+**Weight values per profile (compiled defaults, overridable via signed config):**
 
 | Profile | System | User | Background |
 |---|---|---|---|
@@ -151,19 +174,19 @@ Weight values per profile (compiled defaults, overridable via signed config):
 
 ### Anti-Starvation (Optional, Profile-Dependent)
 
-Anti-starvation is an optional mechanism compiled into Balanced and Performance profiles. It is not compiled into Maximum Isolation or Compute profiles.
+Anti-starvation is compiled into Balanced and Performance profiles. It is not compiled into Maximum Isolation or Compute profiles.
 
-**What it tracks:** Time each head event spends in the Ready Pool — the time it is competing for selection. Time spent stalled does not count. The timer pauses when a container stalls and resumes when the container returns to the Ready Pool, accumulating only Ready Pool time across all visits.
+**What it tracks:** Time each head event spends in the Ready Pool, accumulating only Ready Pool time across all visits. Time spent stalled does not count. Timer pauses during stall, resumes on return to Ready Pool.
 
-**What it does:** When a lane's accumulated Ready Pool time exceeds the configured threshold, that lane's head event receives priority selection in the next cycle, regardless of weight class.
+**What it does:** When a lane's accumulated Ready Pool time exceeds the configured threshold, that lane's head event receives priority dispatch in the next opportunity, regardless of weight class.
 
-**Why it is absent from Maximum Isolation:** Anti-starvation introduces a deadline-based behavioral pattern. When a lane exceeds the threshold, selection behavior becomes predictable. In Maximum Isolation, any predictable behavioral pattern is undesirable and is treated as information leakage.
+**Why absent from Maximum Isolation:** Anti-starvation introduces a deadline-based behavioral pattern that is detectable by adversarial observers.
 
-**Threshold configuration:** Default 100ms, configurable via signed boot configuration. Configuring a shorter threshold means faster recovery from wait states at the cost of more frequent priority overrides.
+**Threshold:** Default 100ms, configurable via signed boot configuration.
 
 ### Full Fairness (Optional, Performance Profile)
 
-Full fairness tracking ensures proportional execution time across all lanes. This provides stronger interactive responsiveness guarantees than anti-starvation alone. It introduces more predictability into kernel behavior and is appropriate for limited hardware environments where responsiveness is the primary requirement.
+Full fairness tracking ensures proportional execution time across all lanes. This provides stronger interactive responsiveness guarantees than anti-starvation alone, at the cost of overhead (~200-400 cycles per event) from timing tracking, deviation calculation, and weight adjustment. This overhead is acceptable for Performance profile where predictability is the priority.
 
 ---
 
@@ -171,42 +194,70 @@ Full fairness tracking ensures proportional execution time across all lanes. Thi
 
 ### Architecture
 
-CIBOS implements multi-core execution through a single Ready Pool managed by a dedicated kernel selector thread, which routes selected events to available execution cores.
+CIBOS implements multi-core execution through a single Ready Pool managed by a dedicated kernel selector, which routes dispatched events to available execution contexts.
 
-**Single Ready Pool:** One pool for the entire system. All head events from all active lanes compete in one weighted entropy selection. No sharding, no complex load balancing between pools.
+**Single Ready Pool:** One pool for the entire system. All head events from all active lanes are in one pool. When competition exists, weighted entropy selects among them.
 
-**Kernel Selector Thread:** One kernel thread owns the Ready Pool and the Stalled List exclusively. Because ownership is exclusive, no locks are needed. The selector processes resource availability signals, updates the pool, applies weighted entropy selection, and routes selected events to available cores.
+**Kernel Selector:** One kernel entity owns the Ready Pool and the Stalled List exclusively. Because ownership is exclusive, no locks are needed. The selector processes resource signals, updates the pool, assesses competition, applies weighted entropy only when needed, and routes events — potentially multiple simultaneously — to available execution contexts.
 
-**Execution Cores:** Each core receives an event from the selector via message queue, executes it, then signals completion or stall condition back to the selector. Cores do not access the Ready Pool directly.
+**Execution Contexts:** Each context receives an event from the selector via message queue, executes it, then signals completion or stall condition back to the selector. Contexts do not access the Ready Pool directly.
 
-**No Global Locks:** The selector owns the pool exclusively. Cores communicate with the selector through message passing. No shared mutable state exists between cores. No coordination mechanism is needed between cores.
+**No Global Locks:** The selector owns the pool exclusively. Contexts communicate with the selector through message passing. No shared mutable state exists between contexts.
 
-**Cache-Aware Routing:** When multiple cores are available, the selector can route based on cache affinity — a core that recently executed events from the same container likely has relevant data cached, reducing execution latency. This optimization requires no shared state between cores.
+**Multiple Events Dispatched Simultaneously:** When multiple execution contexts are available and multiple events are ready with no competition, ALL can be dispatched simultaneously. There is no artificial "one event per opportunity" limitation.
 
-### How Multi-Core Preserves All Guarantees
+### A Single Selector Is Correct for All Scales
 
-The single-pool model preserves all HIP properties because the selector applies weighted entropy identically regardless of how many cores are available. Non-determinism comes from the entropy source, not from the number of cores. Isolation boundaries between containers are enforced independently of how many cores execute events simultaneously — each core receives a single container's event and has no access to other containers' memory.
+A single selector does NOT create a bottleneck. Its work is bounded: signal processing, pool updates, optional weighted entropy computation, and routing. For all deployment contexts CIBOS targets, a single selector provides optimal performance without coordination overhead.
+
+Multiple selectors would introduce lock-like coordination between selectors and are never appropriate for CIBOS architecture.
+
+### Cache-Aware Routing
+
+When multiple execution contexts are available, the selector can route based on cache affinity. No shared state between contexts is required for this optimization.
+
+---
+
+## Execution Capacity: Physical Cores and Logical Cores
+
+### Definitions
+
+**Physical Core:** The actual hardware execution unit.
+**Logical Core:** A hardware thread context presented by a physical core through SMT.
+
+### Execution Capacity
+
+TOTAL SIMULTANEOUS EXECUTIONS = PHYSICAL_CORES × SMT_FACTOR
+
+| Configuration | Simultaneous Events |
+|---|---|
+| 4 cores, no SMT | 4 |
+| 4 cores, 2-way SMT | 8 |
+| 8 cores, 2-way SMT | 16 |
+| 8 cores, 4-way SMT | 32 |
+
+### What Determines Simultaneous Execution
+
+Resource availability determines IF an event is in the Ready Pool. Execution context count determines HOW MANY events run simultaneously. Resource quantity does not increase simultaneous execution beyond available execution contexts.
+
+### SMT and CIBOS Profiles
+
+CIBOS inherits SMT configuration from CIBIOS. SMT is profile-appropriate:
+
+| Profile | SMT | Impact |
+|---|---|---|
+| Maximum Isolation | Disabled | No hardware side channels; fewer simultaneous events |
+| Balanced | Disabled by default | Security-conscious; user may enable |
+| Performance | Enabled | More simultaneous events; maximizes throughput |
+| Compute | Enabled | Maximum parallel computation |
 
 ---
 
 ## Application-Level Time
 
-Time is available to applications as one event source among many. The kernel provides timer events.
+Time is available to applications as one event source among many. Applications request timer events and receive them when the duration expires. Applications implement sleep operations, set timeouts, and perform periodic operations through timer events. Any time-based application logic of any complexity is supported.
 
-**What applications can do:**
-- Request timer events that fire after a specified duration
-- Implement sleep operations through timer events
-- Set timeouts and deadlines using timer events
-- Perform periodic operations using recurring timer events
-- Any time-based application logic of any complexity
-
-**What the kernel does not do:**
-- Use time to make its own coordination decisions
-- Apply fixed time-slice preemption
-- Use time-based backoff for retry mechanisms
-- Make timing-based arbitration decisions
-
-**The distinction:** Time generates events. Entropy selects events. The selector checks whether pending timers have fired as part of collecting ready events each cycle. Fired timers contribute events to the Ready Pool. The selector then applies weighted entropy to the full Ready Pool, which may include timer events. Time is an event source used by applications. It is not a coordination mechanism in the kernel.
+**The kernel does not use time to make coordination decisions.** No fixed time-slice preemption. No time-based backoff. No timer-driven arbitration. Time generates events; dispatch decides which events run.
 
 ---
 
@@ -214,17 +265,15 @@ Time is available to applications as one event source among many. The kernel pro
 
 ### What Channels Are
 
-A channel is a point-to-point communication link between exactly two containers, created by mutual agreement, bound to specific container identifiers, and isolated from all other channels. Channels are not broadcast mechanisms. Channels are not routable without explicit application cooperation. Channels are not discoverable — a container cannot enumerate what other containers or channels exist.
+A channel is a point-to-point communication link between exactly two containers, created by mutual agreement, bound to specific container identifiers, and isolated from all other channels. Channels are not broadcast mechanisms, not routable without explicit application cooperation, and not discoverable.
 
 ### Channel Establishment
 
-Container A requests a channel to B with proposed terms. The kernel validates A's permissions and quota status. The kernel delivers the request to B. B accepts or rejects. If accepted, the kernel creates the channel with agreed parameters and notifies both parties. Terms include directionality, rate limits, message format expectations, lifetime, and encryption mode.
+Container A requests a channel to B with proposed terms. The kernel validates A's permissions and quota status. The kernel delivers the request to B. B accepts all proposed terms as-is, or rejects. Terms cannot be modified by the receiver — either accept all terms or reject entirely. If different terms are needed, A must send a new request. If accepted, the kernel creates the channel and notifies both parties. Terms include directionality, rate limits, message format expectations, lifetime, and encryption mode.
 
 ### Channel Security
 
 The kernel enforces that only A can send on Channel A→B and only B can receive. Rate limits are enforced without exception. Closed channels cannot be used.
-
-Information flows through channels are authorized by the containers that establish them. Unauthorized information flow requires compromise of a container — the channel architecture itself does not create unintended information flows.
 
 ---
 
@@ -242,54 +291,47 @@ RTRO randomizes reported CPU usage per container, memory usage reports, and even
 
 ## Operational Profiles
 
-Operational profiles are build-time configurations defined by Rust feature flags. Changing a profile requires rebuilding the system. The binary is already configured when built. A binary without RTRO contains no RTRO code and cannot have RTRO enabled at runtime — the feature is compiled out.
-
-Profiles are convenience presets. Users with specific requirements can combine individual feature flags directly without using a named profile.
+Operational profiles are build-time configurations defined by Rust feature flags. Changing a profile requires rebuilding the system. The binary is already configured when built.
 
 ---
 
 ### Maximum Isolation Profile
 
-**Threat model:** Adversarial observers may exist on the network, on the physical system, or among multiple users. Behavioral correlation across containers or users is a realistic threat. Maximum observation resistance is required.
+**Threat model:** Adversarial observers may exist. Behavioral correlation across containers or users is a realistic threat. Maximum observation resistance is required.
 
-**Scheduling:**
-- All weights equal (compiled default: 1:1:1, configurable via signed config to any equal values)
-- Anti-starvation: not compiled in
-- Full fairness: not compiled in
-- No weight class differentiation — all events compete identically
+**Scheduling:** All weights equal (1:1:1). Anti-starvation not compiled. Full fairness not compiled. No weight class differentiation — all events compete identically.
 
-**Scheduling behavior:** Maximum non-determinism. System components and user applications compete with equal probability. Under high load, window managers, input handlers, and application containers are selected with equal frequency. Interactive responsiveness may degrade under heavy load. This is intentional — providing preference for system components would create observable patterns.
+**Scheduling behavior:** Maximum non-determinism. System components and user applications compete with equal probability. Under high load, window managers, input handlers, and application containers are selected with equal frequency when competition exists. Interactive responsiveness may degrade under heavy load — this is intentional, as providing preference for system components would create observable patterns.
 
-**Security mechanisms:** RTRO compiled in. Cryptographic IPC compiled in. User authentication compiled in. Multi-user isolation compiled in. Audit logging compiled in. Cryptographic entropy source. Hardware RNG.
+**Security mechanisms:** RTRO compiled. Cryptographic IPC compiled. User authentication compiled. Multi-user isolation compiled. Audit logging compiled. Cryptographic entropy source. Hardware RNG.
 
-**Hardware recommendations:** Modern multi-core processor (4+ cores). 8GB+ RAM. SSD storage. Adequate cores reduce effective contention under the equal-weight scheduling model.
+**SMT:** Disabled.
 
-**Signed configuration accepted:** Yes. Configuration can tune weight values within the equal-weight constraint and other parameters. Invalid or absent configuration falls back to compiled defaults.
+**Hardware recommendations:** Modern multi-core processor (4+ cores). 8GB+ RAM. SSD storage.
 
-**Appropriate deployment:** Enterprise servers, high-security multi-user workstations, research systems where behavioral analysis is a threat, any deployment where sophisticated adversaries justify the performance trade-off.
+**Signed configuration accepted:** Yes. Compiled defaults apply when absent or invalid.
+
+**Appropriate deployment:** Enterprise servers, high-security multi-user workstations, research systems where behavioral analysis is a threat.
 
 ---
 
 ### Balanced Profile
 
-**Threat model:** Network connectivity exists but sophisticated behavioral analysis is not the primary concern. Single or small number of trusted users. A usable system that prioritizes privacy is needed.
+**Threat model:** Network connectivity exists but sophisticated behavioral analysis is not the primary concern. Single or small number of trusted users.
 
-**Scheduling:**
-- System weight: 3 (default, configurable)
-- User weight: 1 (default, configurable)
-- Background weight: 1 (default, configurable)
-- Anti-starvation: compiled in, default threshold 100ms (configurable via signed config)
-- Full fairness: not compiled in
+**Scheduling:** System weight 3 (default), user weight 1 (default), background weight 1 (default). Anti-starvation compiled, default threshold 100ms. Full fairness not compiled.
 
-**Scheduling behavior:** System components are selected approximately 3 times more often than user components of equal count, maintaining interactive responsiveness. Anti-starvation prevents indefinite waiting for any lane. Entropy remains the selection mechanism within weight classes.
+**Scheduling behavior:** System components are selected approximately 3 times more often than user components when competition exists, improving interactive responsiveness. Anti-starvation prevents indefinite wait. Entropy remains the selection mechanism.
 
-**Security mechanisms:** RTRO optional (build flag). Cryptographic IPC compiled in. User authentication compiled in. Multi-user isolation optional (build flag). Audit logging optional (build flag). Cryptographic entropy source. Hardware RNG.
+**Security mechanisms:** RTRO optional (build flag). Cryptographic IPC compiled. User authentication compiled. Multi-user isolation optional (build flag). Audit logging optional (build flag). Cryptographic entropy source. Hardware RNG.
 
-**Hardware recommendations:** Dual-core or better processor. 4GB+ RAM. Any storage. Functions well on mid-range hardware.
+**SMT:** Disabled by default; user may enable.
 
-**Signed configuration accepted:** Yes. Weight values and anti-starvation threshold are configurable.
+**Hardware recommendations:** Dual-core or better processor. 4GB+ RAM.
 
-**Appropriate deployment:** Developer laptops, personal workstations, home computing, small team workstations, systems where privacy matters but maximum isolation overhead is not justified.
+**Signed configuration accepted:** Yes.
+
+**Appropriate deployment:** Developer laptops, personal workstations, home computing.
 
 ---
 
@@ -297,22 +339,19 @@ Profiles are convenience presets. Users with specific requirements can combine i
 
 **Threat model:** Behavioral observation resistance is not a primary concern. Single trusted user. Physical security provides primary protection. Responsiveness on limited hardware is the priority.
 
-**Scheduling:**
-- System weight: 5 (default, configurable)
-- User weight: 2 (default, configurable)
-- Background weight: 1 (default, configurable)
-- Anti-starvation: compiled in
-- Full fairness: compiled in
+**Scheduling:** System weight 5 (default), user weight 2 (default), background weight 1 (default). Anti-starvation compiled. Full fairness compiled.
 
-**Scheduling behavior:** System components strongly preferred to maintain interactive quality on limited hardware. Full fairness ensures all lanes eventually execute proportionally. Maximum responsiveness with minimum stall impact.
+**Scheduling behavior:** System components strongly preferred to maintain interactive quality on limited hardware. Full fairness ensures all lanes eventually execute proportionally. Maximum responsiveness with minimum stall impact. Full fairness overhead (~200-400 cycles per event) is acceptable because predictability is the priority.
 
-**Security mechanisms:** RTRO: not compiled. Cryptographic IPC optional (build flag). User authentication optional (build flag). Multi-user isolation: not compiled. Audit logging: not compiled. Cryptographic entropy source.
+**Security mechanisms:** RTRO not compiled. Cryptographic IPC optional (build flag). User authentication optional (build flag). Multi-user isolation not compiled. Audit logging not compiled. Cryptographic entropy source.
 
-**Hardware recommendations:** Any 64-bit processor. 2GB+ RAM. Any storage. Designed to function well on older and resource-constrained hardware.
+**SMT:** Enabled.
 
-**Signed configuration accepted:** Yes. Weight values and thresholds configurable.
+**Hardware recommendations:** Any 64-bit processor. 2GB+ RAM. Any storage.
 
-**Appropriate deployment:** Legacy hardware, embedded systems, resource-constrained devices, offline workstations, single-user development machines in physically secured environments.
+**Signed configuration accepted:** Yes.
+
+**Appropriate deployment:** Legacy hardware, embedded systems, resource-constrained devices, offline workstations.
 
 ---
 
@@ -320,23 +359,21 @@ Profiles are convenience presets. Users with specific requirements can combine i
 
 **Threat model:** Single trusted user. Air-gapped. Physically secured. No adversarial observer exists. Maximum computational performance is required.
 
-**Scheduling:**
-- All weights equal by default (configurable; CLI priority option: system weight 2, compute weight 1)
-- Anti-starvation: optional (build flag)
-- Full fairness: optional (build flag)
-- Per-lane weights: compiled in (container-level, application-controlled)
+**Scheduling:** All weights equal by default (configurable; CLI priority option: system weight 2, compute weight 1). Anti-starvation optional (build flag). Full fairness optional (build flag). Per-lane weights compiled.
 
 **Two valid compute scheduling configurations:**
 
-*Compute with CLI priority:* System class (CLI) weight 2, compute lanes weight 1, anti-starvation on. CLI remains responsive during computation. Progress can be monitored without disrupting workloads.
+*Compute with CLI priority:* System class (CLI) weight 2, compute lanes weight 1. CLI remains responsive during computation. Users can monitor progress without disrupting workloads.
 
-*Pure compute:* All weights equal, anti-starvation on. CLI and compute lanes compete equally. Appropriate for fire-and-wait workflows where the user launches computation and returns for results.
+*Pure compute:* All weights equal. CLI and compute lanes compete equally. Appropriate for fire-and-wait workflows.
 
-**Security mechanisms:** RTRO: not compiled. Cryptographic IPC: not compiled. Lightweight handshake IPC compiled in. User authentication: not compiled. Multi-user isolation: not compiled. Audit logging: not compiled. Cryptographic entropy source.
+**Security mechanisms:** RTRO not compiled. Cryptographic IPC not compiled. Lightweight handshake IPC compiled. User authentication not compiled. Multi-user isolation not compiled. Audit logging not compiled. Cryptographic entropy source.
 
-**Hardware recommendations:** Any 64-bit processor. 128MB+ RAM (minimum for meaningful parallel lane workloads; 32MB is the kernel-only minimum). Fast storage for application loading. Actual workload requirements determine hardware sizing.
+**SMT:** Enabled.
 
-**Signed configuration accepted:** Yes. Configuration signing requirements depend on deployment context — physically secured air-gapped systems may omit signing. Weight values and per-lane weight defaults configurable.
+**Hardware recommendations:** Any 64-bit processor. 128MB+ RAM (32MB kernel-only minimum). Actual workload requirements determine sizing.
+
+**Signed configuration accepted:** Yes. Configuration signing requirements depend on deployment context — physically secured air-gapped systems may omit signing.
 
 **Appropriate deployment:** Air-gapped research and computation systems, quantum-like algorithm development, parallel computation research, single-user offline computation requiring maximum throughput.
 
@@ -362,7 +399,7 @@ Profiles are convenience presets. Users with specific requirements can combine i
 | `user-authentication` | Identity verification infrastructure | Maximum Isolation, Balanced |
 | `multi-user-isolation` | User-level isolation between users | Maximum Isolation |
 | `audit-logging` | Cryptographic event logging | Maximum Isolation |
-| `cryptographic-entropy` | CSPRNG quality entropy for scheduling | All |
+| `cryptographic-entropy` | CSPRNG quality entropy for dispatch decisions | All |
 | `hardware-rng` | Hardware random number generator | All |
 
 ### Handoff Mechanisms (Shared with CIBIOS)
@@ -391,11 +428,11 @@ Platform variants describe the interface and capability set. They compose with o
 
 ### CIBOS-CLI: Command Line Interface
 
-Appropriate for servers, embedded systems, compute-focused systems, and power users who do not need graphical interfaces. Minimal resource overhead. No graphics stack. Appropriate for Maximum Isolation, Balanced, Performance, and Compute profiles.
+Appropriate for servers, embedded systems, compute-focused systems, and power users. Minimal resource overhead. No graphics stack. Appropriate for all profiles.
 
 ### CIBOS-GUI: Desktop Computing
 
-Appropriate for personal workstations and developer machines. Includes window management, compositor, graphics isolation, and input isolation. Applications are fully isolated — one application cannot observe another's window contents, input, or activity. All profiles support GUI, with performance characteristics varying by profile selection.
+Appropriate for personal workstations and developer machines. Includes window management, compositor, graphics isolation, and input isolation. Applications are fully isolated — one application cannot observe another's window contents, input, or activity. All profiles support GUI.
 
 ### CIBOS-MOBILE: Smartphone and Tablet
 
@@ -407,7 +444,7 @@ Appropriate for mobile devices including older devices that manufacturers no lon
 
 ### Data Compartmentalization
 
-**File System Isolation:** Each application receives its own view of the file system including only explicitly authorized files. Applications cannot discover or access files belonging to other applications.
+**File System Isolation:** Each application receives its own view of the file system. Applications cannot discover or access files belonging to other applications.
 
 **Memory Isolation:** Applications cannot access memory belonging to other applications. This isolation is hardware-enforced by CIBIOS before CIBOS began executing.
 
@@ -427,15 +464,15 @@ Appropriate for mobile devices including older devices that manufacturers no lon
 
 CIBOS enables quantum-like computational properties through architectural decisions present in all profiles.
 
-**Parallel pathway maintenance:** Multiple lanes per container allow multiple solution approaches to proceed simultaneously without global locks causing serialization. Applications can explore multiple solution pathways in parallel without coordination overhead.
+**Parallel pathway maintenance:** Multiple lanes per container allow multiple solution approaches to proceed simultaneously. Applications explore multiple solution pathways simultaneously without coordination overhead.
 
-**Interference-free processing:** Isolation boundaries prevent cross-component interference by architecture. No shared state means no interference patterns.
+**Interference-free processing:** Isolation boundaries prevent cross-component interference. No shared state means no interference patterns.
 
-**Non-deterministic correct execution:** Weighted entropy selection produces unpredictable but correct execution order.
+**Non-deterministic correct execution:** Weighted entropy produces unpredictable but correct dispatch when competition exists.
 
 **Application-controlled resolution:** Parallel lane results are resolved by application logic, not by physics-imposed collapse. Applications create lanes, assign computation, allow parallel execution, and collect all results when ready. All results are preserved. One run is sufficient. No repeated runs needed for statistical reconstruction.
 
-Maximum Isolation's equal weights provide the most non-deterministic scheduling behavior. Compute's per-lane weights and lightweight IPC provide the highest computational throughput. The quantum-like properties are present across all profiles; the specific expression varies by configuration.
+Maximum Isolation's equal weights provide the most non-deterministic dispatch behavior. Compute's per-lane weights and lightweight IPC provide the highest computational throughput. The quantum-like properties are present across all profiles; the specific expression varies by configuration.
 
 ---
 
@@ -445,34 +482,48 @@ CIBOS does not set up its own isolation boundaries. CIBIOS establishes isolation
 
 - Memory isolation boundaries already enforced by hardware
 - Lane memory regions already reserved and isolated
+- SMT configuration already established
 - Hardware configuration already recorded
 
 CIBOS builds on this foundation: the weighted entropy scheduler, container management, channel infrastructure, security infrastructure, and user interface subsystems appropriate to the built profile.
 
 ---
 
-## Repository Structure
+## Configuration System
 
-A single repository contains both CIBIOS and CIBOS. The workspace Cargo.toml defines shared feature flags and manages the dependency relationship between firmware and OS.
+### Boot-Time Signed Configuration
 
-Directories:
-- `/firmware/` — CIBIOS source code and profile definitions
-- `/kernel/` — CIBOS kernel source code
-- `/shared/` — Common types, protocols, and abstractions
-- `/platforms/` — Architecture-specific code for x86_64, ARM64, RISC-V
-- `/tools/` — Build configuration and signing tools
-- `/profiles/` — Profile definition files as Rust feature flag sets
-- `/docs/` — Extended documentation
+All profiles accept signed configuration at boot:
+
+```
+[scheduling]
+system_weight = 3
+user_weight = 1
+background_weight = 1
+anti_starvation_threshold_ms = 100
+
+[resources]
+memory_limit_per_container_mb = 512
+```
+
+Invalid or absent configuration falls back to compiled defaults.
+
+| Profile | Config File | Signature Required |
+|---|---|---|
+| Maximum Isolation | Accepted | Yes |
+| Balanced | Accepted | Yes |
+| Performance | Accepted | Yes |
+| Compute | Accepted | Context-dependent |
 
 ---
 
 ## Development Roadmap
 
 **Phase 1: Core Microkernel and Isolation Implementation (Months 1 to 12)**
-Weighted entropy scheduler with Catch and Release mechanism. Lane creation and management. Memory management with hardware isolation boundaries inherited from CIBIOS. Inter-process communication for both modes. Security infrastructure. All four operational profiles implemented and validated.
+Weighted entropy dispatcher with Catch and Release mechanism. Lane creation and management. Memory management with hardware isolation boundaries inherited from CIBIOS. Inter-process communication for both modes. Security infrastructure. All four operational profiles implemented and validated.
 
 **Phase 2: System Services and Platform Variants (Months 10 to 20)**
-Isolated system services: file systems, network management, device drivers. CIBOS-CLI, CIBOS-GUI, and CIBOS-MOBILE development with platform-specific optimizations while maintaining identical isolation architecture.
+Isolated system services: file systems, network management, device drivers. CIBOS-CLI, CIBOS-GUI, and CIBOS-MOBILE development.
 
 **Phase 3: Application Framework and Performance Optimization (Months 18 to 28)**
 Native application development framework. System-wide performance optimization. Open-source development infrastructure.
@@ -484,9 +535,9 @@ Comprehensive security testing. Independent security analysis. Production deploy
 
 ## Future Research: Transition to Non-Binary Computing
 
-The isolation-first design philosophy positions CIBOS as an ideal foundation for computing systems that move beyond binary logic. The mathematical isolation model at CIBOS's core is hardware-agnostic. Isolation boundaries, event-driven coordination, lane-based execution, and weighted entropy selection remain valid regardless of the underlying computational substrate.
+The isolation-first design philosophy positions CIBOS as an ideal foundation for computing systems that move beyond binary logic. The mathematical isolation model at CIBOS's core is hardware-agnostic. Isolation boundaries, event-driven coordination, lane-based execution, and weighted entropy dispatch remain valid regardless of the underlying computational substrate.
 
-Future research areas include integration with non-binary computing substrates, implementation of programming interfaces appropriate for non-binary execution models, and exploration of how quantum-like properties that CIBOS achieves through software may have natural hardware expressions in non-binary substrates. Non-binary substrates may also require languages designed for their execution models — research into appropriate non-binary programming paradigms and transition pathways from current Rust implementations represents a future development area.
+Future research areas include integration with non-binary computing substrates, implementation of programming interfaces appropriate for non-binary execution models, and exploration of how quantum-like properties that CIBOS achieves through software may have natural hardware expressions in non-binary substrates.
 
 ---
 
