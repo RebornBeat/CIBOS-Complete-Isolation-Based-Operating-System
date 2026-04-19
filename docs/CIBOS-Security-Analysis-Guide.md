@@ -288,6 +288,48 @@ DISPATCH CORRECTNESS:
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### Signal Coalescence Security Verification
+
+Signal coalescence does NOT reintroduce timing side channels:
+
+**Verification:**
+
+```bash
+cibos-test --signal-coalescence-security
+
+Tests:
+  1. Signal processing time distribution
+  2. Batch size correlation with container behavior
+  3. Timing pattern observability
+
+Expected:
+  - No correlation between batch size and container activity
+  - No observable timing patterns from coalescence
+  - Processing time independent of which containers benefit
+```
+
+**Key invariant:** Signal coalescence processes inputs faster, but does not reveal which containers were waiting for those signals.
+
+### Signal Threshold Security Verification
+
+The signal-coalescence-threshold does NOT create a dispatch timing channel:
+
+**Verification:**
+
+```bash
+cibos-test --signal-threshold-security
+
+Tests:
+  1. Threshold affects signal processing, not dispatch
+  2. No observable dispatch timing correlation with threshold fires
+  3. Container selection independent of signal buffer age
+
+Expected:
+  - Threshold only affects when signals are processed
+  - Dispatch remains entropy-based
+  - No correlation between threshold and container selection
+```
+
 ### Verification Checklist
 
 ```
@@ -417,6 +459,64 @@ ISOLATION TESTS:
 │  └─────────────────────────────────────────────────────┘   │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
+```
+
+### Class Resource Pool Isolation
+
+When `class-resource-pools` is enabled:
+
+```bash
+cibos-test --isolation class-pools
+
+Tests:
+  1. System container cannot exhaust user pool
+  2. User container cannot exhaust system pool
+  3. Background container cannot exhaust any other pool
+  4. Pool exhaustion only affects same-class containers
+
+Expected:
+  - Cross-class isolation maintained
+  - No cross-pool borrowing
+  - Class boundaries enforced
+```
+
+### Core Affinity Isolation
+
+When `class-core-affinity` is enabled:
+
+```bash
+cibos-test --isolation core-affinity
+
+Tests:
+  1. System event never dispatched to user context
+  2. User event never dispatched to system context
+  3. Affinity routing is deterministic by class
+  4. No cross-pool dispatch occurs
+
+Expected:
+  - Class-context boundaries enforced
+  - Routing is deterministic (class is not secret)
+  - No side channel from routing
+```
+
+### Sensor Isolation Verification
+
+When `sensor-subsystem` is enabled:
+
+```bash
+cibos-test --isolation sensors
+
+Tests:
+  1. Container A cannot observe Container B's sensor access
+  2. Sensor data never crosses container boundaries
+  3. Authorization required for each access
+  4. System indicators accurate when sensors active
+  5. Revocation immediately blocks access
+
+Expected:
+  - Complete sensor isolation
+  - No cross-container observation
+  - Per-access authorization enforced
 ```
 
 ---
@@ -1010,6 +1110,35 @@ AUDIT REPORT:
 │  □ SMT status correct for profile: [PASS / FAIL]            │
 │  □ Execution context count matches (physical × SMT factor):  │
 │    [PASS / FAIL]                                           │
+│                                                             │
+│  SIGNAL COALESCENCE VERIFICATION (if compiled in):          │
+│  □ No timing patterns from batch processing: [PASS / FAIL] │
+│  □ Batch size uncorrelated with container behavior:        │
+│    [PASS / FAIL]                                           │
+│  □ Processing overhead consistent: [PASS / FAIL]           │
+│                                                             │
+│  SIGNAL THRESHOLD VERIFICATION (if compiled in):            │
+│  □ Threshold affects signal processing only: [PASS / FAIL] │
+│  □ No dispatch timing correlation: [PASS / FAIL]           │
+│  □ Container selection independent of signal buffer:        │
+│    [PASS / FAIL]                                           │
+│                                                             │
+│  CLASS RESOURCE POOLS VERIFICATION (if compiled in):        │
+│  □ Cross-pool isolation maintained: [PASS / FAIL]          │
+│  □ Pool exhaustion only affects same-class: [PASS / FAIL]  │
+│  □ No cross-pool borrowing: [PASS / FAIL]                  │
+│                                                             │
+│  CORE AFFINITY VERIFICATION (if compiled in):               │
+│  □ Class-context boundaries enforced: [PASS / FAIL]        │
+│  □ Routing deterministic by class: [PASS / FAIL]           │
+│  □ No side channel from routing: [PASS / FAIL]             │
+│                                                             │
+│  SENSOR ISOLATION VERIFICATION (if compiled in):            │
+│  □ Complete sensor isolation: [PASS / FAIL]                │
+│  □ No cross-container observation: [PASS / FAIL]           │
+│  □ Per-access authorization enforced: [PASS / FAIL]        │
+│  □ System indicators accurate: [PASS / FAIL]               │
+│  □ Revocation immediate: [PASS / FAIL]                     │
 │                                                             │
 │  RESIDUAL RISKS (documented, not failures):                 │
 │  □ Hardware surveillance limitations documented: [YES / NO] │
