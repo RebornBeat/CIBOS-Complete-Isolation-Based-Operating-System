@@ -216,6 +216,50 @@ Multiple selectors would introduce lock-like coordination between selectors and 
 
 When multiple execution contexts are available, the selector can route based on cache affinity. No shared state between contexts is required for this optimization.
 
+### Core Assignation by Weight Class (Optional Feature)
+
+When `class-core-affinity` is enabled, the selector routes events to execution contexts based on weight class:
+
+```
+DEFAULT (class-core-affinity disabled):
+  All execution contexts available to all events
+  Routing considers only last-container cache affinity
+
+ENABLED (class-core-affinity enabled):
+  Execution contexts partitioned by class:
+    system_contexts: [0-3]   // 4 contexts for system class
+    user_contexts: [4-7]     // 4 contexts for user class
+    background_contexts: [8]  // 1 context for background class
+
+  System events route only to system_contexts
+  User events route only to user_contexts
+  Background events route only to background_contexts
+```
+
+**This is NOT sharding and does NOT add complexity.**
+
+- The selector remains single (no change)
+- The Ready Pool remains single (no change)
+- Ownership remains exclusive (no change)
+- Routing decision simply adds class as a consideration
+- Existing cache affinity logic works within each class pool
+- No coordination between context pools
+- No cross-pool locks
+- Same O(1) routing complexity
+
+**Configuration:**
+
+```toml
+[core-affinity]
+# Number of execution contexts per class (logical cores × SMT factor = total)
+# Values must sum to total execution contexts
+system_contexts = 4
+user_contexts = 3
+background_contexts = 1
+```
+
+If configuration is absent or invalid, falls back to even distribution.
+
 ---
 
 ## Execution Capacity: Physical Cores and Logical Cores
@@ -301,7 +345,7 @@ Operational profiles are build-time configurations defined by Rust feature flags
 
 **Scheduling:** All weights equal (1:1:1). Anti-starvation not compiled. Full fairness not compiled. No weight class differentiation — all events compete identically.
 
-**Scheduling behavior:** Maximum non-determinism. System components and user applications compete with equal probability. Under high load, window managers, input handlers, and application containers are selected with equal frequency when competition exists. Interactive responsiveness may degrade under heavy load — this is intentional, as providing preference for system components would create observable patterns.
+**Scheduling behavior:** Maximum non-determinism. System components and user applications compete with equal probability when competition exists. Under high load, window managers, input handlers, and application containers are selected with equal frequency. Interactive responsiveness may degrade under heavy load — this is intentional, as providing preference for system components would create observable patterns.
 
 **Security mechanisms:** RTRO compiled. Cryptographic IPC compiled. User authentication compiled. Multi-user isolation compiled. Audit logging compiled. Cryptographic entropy source. Hardware RNG.
 
@@ -310,6 +354,14 @@ Operational profiles are build-time configurations defined by Rust feature flags
 **Hardware recommendations:** Modern multi-core processor (4+ cores). 8GB+ RAM. SSD storage.
 
 **Signed configuration accepted:** Yes. Compiled defaults apply when absent or invalid.
+
+**Optional features (can be added via custom build):**
+- None (security profile - no optional features recommended)
+
+**Platform variants:**
+- CIBOS-CLI: Required [cli-interface]
+- CIBOS-GUI: Required [gui-subsystem, display-subsystem, cli-interface]
+- CIBOS-MOBILE: Requires additional mobile features (touch-subsystem, sensor-subsystem, display-subsystem, power-management, cli-interface)
 
 **Appropriate deployment:** Enterprise servers, high-security multi-user workstations, research systems where behavioral analysis is a threat.
 
@@ -331,6 +383,18 @@ Operational profiles are build-time configurations defined by Rust feature flags
 
 **Signed configuration accepted:** Yes.
 
+**Optional features (can be added via custom build):**
+- `rtro` — Additional behavioral obfuscation
+- `signal-coalescence` — Improves throughput
+- `signal-coalescence-threshold` — Adds backstop for signal buffer
+- `class-resource-pools` — Isolates resource usage by class
+- `class-core-affinity` — Assigns cores to weight classes
+
+**Platform variants:**
+- CIBOS-CLI: Required [cli-interface], Optional [network-stack, usb-stack, audio-subsystem]
+- CIBOS-GUI: Required [gui-subsystem, display-subsystem, cli-interface], Optional [network-stack, audio-subsystem]
+- CIBOS-MOBILE: Required [touch-subsystem, sensor-subsystem, display-subsystem, power-management, cli-interface], Optional [mobile-connectivity, network-stack, audio-subsystem]
+
 **Appropriate deployment:** Developer laptops, personal workstations, home computing.
 
 ---
@@ -350,6 +414,17 @@ Operational profiles are build-time configurations defined by Rust feature flags
 **Hardware recommendations:** Any 64-bit processor. 2GB+ RAM. Any storage.
 
 **Signed configuration accepted:** Yes.
+
+**Optional features (can be added via custom build):**
+- `signal-coalescence` — Further improves throughput
+- `signal-coalescence-threshold` — Adds backstop for signal buffer
+- `class-resource-pools` — Isolates resource usage by class
+- `class-core-affinity` — Guarantees execution capacity per class
+
+**Platform variants:**
+- CIBOS-CLI: Required [cli-interface]
+- CIBOS-GUI: Optional [gui-subsystem, display-subsystem]
+- CIBOS-MOBILE: Optional (typically not used with Performance profile)
 
 **Appropriate deployment:** Legacy hardware, embedded systems, resource-constrained devices, offline workstations.
 
@@ -375,6 +450,18 @@ Operational profiles are build-time configurations defined by Rust feature flags
 
 **Signed configuration accepted:** Yes. Configuration signing requirements depend on deployment context — physically secured air-gapped systems may omit signing.
 
+**Optional features (can be added via custom build):**
+- `anti-starvation` — Prevents lane starvation
+- `signal-coalescence` — Improves throughput
+- `signal-coalescence-threshold` — Adds backstop for signal buffer
+- `class-resource-pools` — Isolates resource usage by class
+- `class-core-affinity` — Assigns cores to weight classes
+
+**Platform variants:**
+- CIBOS-CLI: Required [cli-interface]
+- CIBOS-GUI: Optional (compute-focused systems typically CLI-only)
+- CIBOS-MOBILE: Not applicable (compute profile for air-gapped computation)
+
 **Appropriate deployment:** Air-gapped research and computation systems, quantum-like algorithm development, parallel computation research, single-user offline computation requiring maximum throughput.
 
 ---
@@ -388,6 +475,15 @@ Operational profiles are build-time configurations defined by Rust feature flags
 | `anti-starvation` | Ready Pool wait time tracking and threshold priority | Balanced, Performance |
 | `full-fairness` | Proportional execution time tracking | Performance |
 | `per-lane-weights` | Container-level per-lane weight assignment | Compute |
+
+### Optional Performance Features
+
+| Flag | What It Enables | Default | Overhead |
+|---|---|---|---|
+| `signal-coalescence` | Batch process resource signals | Disabled | ~20-50 bytes signal buffer |
+| `signal-coalescence-threshold` | Time backstop for signal buffer | Disabled | ~16 bytes for timestamp |
+| `class-resource-pools` | Per-class memory isolation | Disabled | ~64 bytes per class pool |
+| `class-core-affinity` | Core assignment by weight class | Disabled | ~16 bytes per class context map |
 
 ### Security Mechanisms
 
@@ -409,16 +505,69 @@ Operational profiles are build-time configurations defined by Rust feature flags
 | `handoff-cryptographic` | Cryptographic CIBIOS-to-CIBOS handoff |
 | `handoff-lightweight` | Lightweight CIBIOS-to-CIBOS handoff |
 
-### Capability Mechanisms
+### Capability Features
 
-| Flag | What It Enables |
-|---|---|
-| `network-stack` | TCP/IP networking infrastructure |
-| `usb-stack` | USB device support beyond boot |
-| `gui-subsystem` | Graphics and window management |
-| `cli-interface` | Text-based command line interface |
-| `audio-subsystem` | Sound input and output |
-| `dynamic-lanes` | Runtime lane creation on demand |
+| Flag | What It Enables | Default | Overhead |
+|---|---|---|---|
+| `network-stack` | TCP/IP networking | Disabled | ~2MB code, runtime varies |
+| `usb-stack` | USB device support | Disabled | ~500KB code |
+| `gui-subsystem` | Graphics and window management | Disabled | ~5MB code, runtime varies |
+| `cli-interface` | Text-based command line | Enabled | ~100KB code |
+| `audio-subsystem` | Sound input and output | Disabled | ~1MB code |
+| `dynamic-lanes` | Runtime lane creation | Disabled | ~50 bytes per lane metadata |
+| `touch-subsystem` | Touch input with isolation | Disabled | ~200KB code |
+| `sensor-subsystem` | All sensors with isolation | Disabled | ~300KB code + per-sensor |
+| `mobile-connectivity` | Cellular, Bluetooth, NFC | Disabled | ~1MB code |
+| `power-management` | Battery and power states | Disabled | ~100KB code |
+| `display-subsystem` | Display control with isolation | Disabled | ~500KB code |
+
+---
+
+## Feature Flag Interaction Matrix
+
+Performance features are independent and can be combined freely. Capability features are independent and can be combined freely. Performance and capability features are independent.
+
+### Performance Feature Matrix
+
+```
+                        anti-    signal-  signal-     class-    class-
+                        starv    coales   coales-th   pools     affinity
+
+anti-starvation          N/A       YES       YES        YES        YES
+signal-coalescence       YES       N/A       YES        YES        YES
+signal-coalescence-th    YES       YES       N/A         YES        YES
+class-resource-pools     YES       YES       YES        N/A        YES
+class-core-affinity      YES       YES       YES        YES        N/A
+```
+
+### Capability Feature Matrix
+
+All 11 capability features are mutually compatible. Any combination can be compiled together.
+
+### Shared Infrastructure
+
+When `anti-starvation` and `signal-coalescence-threshold` are both compiled in:
+- Share the same timing source
+- Share threshold comparison logic
+- Single timing subsystem for both purposes
+- No additional overhead for the second feature
+
+### Combination Examples
+
+Maximum throughput (Compute profile customization):
+```
+--features "signal-coalescence,signal-coalescence-threshold,per-lane-weights,lightweight-handshake,cli-interface"
+```
+
+Secure with improved throughput (Balanced profile customization):
+```
+--features "anti-starvation,signal-coalescence,signal-coalescence-threshold,cryptographic-ipc,gui-subsystem"
+```
+
+Mobile device (Balanced security, full mobile capabilities):
+```
+--features "anti-starvation,cryptographic-ipc,user-authentication,cryptographic-entropy,hardware-rng,touch-subsystem,sensor-subsystem,display-subsystem,power-management,mobile-connectivity,network-stack,audio-subsystem,cli-interface,handoff-cryptographic"
+```
 
 ---
 
@@ -430,13 +579,134 @@ Platform variants describe the interface and capability set. They compose with o
 
 Appropriate for servers, embedded systems, compute-focused systems, and power users. Minimal resource overhead. No graphics stack. Appropriate for all profiles.
 
+Required: cli-interface
+Optional: network-stack, usb-stack, audio-subsystem
+All profiles: supported
+Typical use: servers, embedded systems, compute clusters, air-gapped computation
+
 ### CIBOS-GUI: Desktop Computing
 
 Appropriate for personal workstations and developer machines. Includes window management, compositor, graphics isolation, and input isolation. Applications are fully isolated — one application cannot observe another's window contents, input, or activity. All profiles support GUI.
 
+Required: gui-subsystem, display-subsystem, cli-interface
+Optional: network-stack, usb-stack, audio-subsystem, touch-subsystem
+All profiles: supported
+Typical use: personal workstations, development machines, desktop computing
+
 ### CIBOS-MOBILE: Smartphone and Tablet
 
 Appropriate for mobile devices including older devices that manufacturers no longer support. Includes touch interface isolation, sensor isolation, mobile connectivity management, and power optimization. Privacy protection exceeds what iOS or Android provide because the isolation architecture prevents applications from observing each other regardless of permissions. Camera, microphone, GPS, and other sensors require explicit per-access authorization enforced by isolation boundaries.
+
+Required: touch-subsystem, sensor-subsystem, display-subsystem, power-management, cli-interface
+Optional: mobile-connectivity, network-stack, audio-subsystem, gui-subsystem
+Recommended profiles: Maximum Isolation, Balanced
+Not recommended: Compute (mobile devices typically network-connected)
+Typical use: smartphones, tablets, mobile devices
+
+**Sensor Isolation in CIBOS-MOBILE:**
+
+When sensor-subsystem is enabled, each sensor has complete isolation:
+
+```
+SENSOR ISOLATION ARCHITECTURE:
+
+┌─────────────────────────────────────────────────────────────┐
+│                    SENSOR ISOLATION                          │
+│                                                             │
+│  Each sensor is an isolated resource:                       │
+│                                                             │
+│  CAMERA:                                                    │
+│  - Per-access authorization required                       │
+│  - Isolation boundary around camera hardware               │
+│  - Container requests access via channel                   │
+│  - User approval per access                                │
+│  - Camera data never crosses container boundary            │
+│                                                             │
+│  MICROPHONE:                                                │
+│  - Per-access authorization required                       │
+│  - Isolation boundary around microphone hardware           │
+│  - Recording indicator visible system-wide                 │
+│  - Audio data never crosses container boundary             │
+│                                                             │
+│  GPS:                                                       │
+│  - Per-access authorization required                       │
+│  - Location data isolated to requesting container          │
+│  - Coarse location option for privacy                      │
+│  - Location history per-container                          │
+│                                                             │
+│  OTHER SENSORS:                                             │
+│  - Accelerometer, gyroscope, proximity, ambient light,     │
+│    barometer, magnetometer, etc.                           │
+│  - Each has isolation boundary                             │
+│  - Per-access authorization                                │
+│  - Data never shared between containers                    │
+│                                                             │
+│  NO SENSOR DATA EVER SHARED BETWEEN CONTAINERS              │
+│  AUTHORIZATION REQUIRED PER ACCESS                          │
+│  SYSTEM INDICATORS WHEN SENSORS ACTIVE                      │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Power Management in CIBOS-MOBILE:**
+
+When power-management is enabled:
+
+- Battery state tracking with isolation
+- Power state transitions managed by kernel
+- Per-container power budgets configurable
+- Background containers throttled when battery low
+- System containers maintain minimum execution
+- No cross-container power observation
+
+**Important:** Platform variants are convenience presets. Any valid feature combination can be built. The variant labels describe common use cases, not system constraints.
+
+---
+
+## Resource Management
+
+### Class Resource Pools (Optional Feature)
+
+When `class-resource-pools` is enabled, each weight class has its own memory pool:
+
+```
+DEFAULT (class-resource-pools disabled):
+  Global memory pool for all containers
+  Per-container limits still apply
+  Memory freed by any container available to any other
+
+ENABLED (class-resource-pools enabled):
+  Separate pools per class:
+    system_pool: 40% of total RAM
+    user_pool: 50% of total RAM
+    background_pool: 10% of total RAM
+
+  System containers allocate only from system_pool
+  User containers allocate only from user_pool
+  Background containers allocate only from background_pool
+
+  No cross-pool borrowing
+  No coordination between pools
+  Each pool independently tracked by selector
+```
+
+**Configuration:**
+
+```toml
+[resource-pools]
+system_pool_pct = 40
+user_pool_pct = 50
+background_pool_pct = 10
+# Percentages must sum to 100
+```
+
+**Trade-off:** Class pools prevent one class from starving others but may underutilize memory if one pool is idle while another is exhausted.
+
+**Implementation notes:**
+- Pools are metadata owned by selector
+- No locks needed - single owner tracks all pools
+- Container allocation checks its class pool before proceeding
+- Pool exhaustion causes stall (Catch and Release), not failure
 
 ---
 
@@ -473,6 +743,37 @@ CIBOS enables quantum-like computational properties through architectural decisi
 **Application-controlled resolution:** Parallel lane results are resolved by application logic, not by physics-imposed collapse. Applications create lanes, assign computation, allow parallel execution, and collect all results when ready. All results are preserved. One run is sufficient. No repeated runs needed for statistical reconstruction.
 
 Maximum Isolation's equal weights provide the most non-deterministic dispatch behavior. Compute's per-lane weights and lightweight IPC provide the highest computational throughput. The quantum-like properties are present across all profiles; the specific expression varies by configuration.
+
+### Signal Coalescence for Throughput (Optional Feature)
+
+When `signal-coalescence` is enabled, the kernel processes multiple resource signals in a single selector loop iteration:
+
+```
+WITHOUT signal-coalescence:
+  Signal: Buffer A freed → Selector loop → Process
+  Signal: Buffer B freed → Selector loop → Process
+  Signal: Buffer C freed → Selector loop → Process
+  (3 selector loop invocations, 3 qualification checks)
+
+WITH signal-coalescence:
+  Signals: A, B, C freed → Collected in buffer
+  → Single selector loop → Process all three
+  (1 selector loop invocation, 1 batch qualification check)
+
+Savings: ~275 cycles per signal when coalesced (~70% reduction)
+```
+
+**This does NOT reintroduce time constraints.**
+
+Signal coalescence is opportunistic: when multiple signals arrive together (same interrupt, same poll cycle, same timer scan), they are processed together. There is no "waiting for more signals." The system processes what has arrived.
+
+**Signal-coalescence-threshold:**
+
+If `signal-coalescence-threshold` is enabled, signals that have been buffered longer than the threshold trigger immediate processing regardless of batch size.
+
+This is a SIGNAL PROCESSING threshold, not a dispatch threshold. It determines when the kernel checks resource availability for stalled containers. It does NOT affect which events are selected or when they execute.
+
+The threshold feature can share timing infrastructure with anti-starvation if both are compiled in, but neither requires the other. Each works independently.
 
 ---
 
