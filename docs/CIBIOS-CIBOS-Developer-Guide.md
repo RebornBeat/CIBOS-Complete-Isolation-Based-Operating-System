@@ -357,6 +357,12 @@ The structure is defined in the `shared` crate with `#[repr(C)]` for binary comp
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### Signal Coalescence at Firmware Level
+
+CIBIOS does not implement signal coalescence. Signal coalescence is a kernel feature. CIBIOS initializes hardware and transfers control; signal processing happens after CIBOS begins execution.
+
+Future hardware research may implement signal coalescence in silicon, which would be visible to CIBIOS during hardware initialization, but current implementation is software-only in CIBOS.
+
 ---
 
 ## Chapter 3: The Two-Layer Execution Model Implementation
@@ -584,6 +590,205 @@ signal_processor_loop():
         DataAvailable(chid):
           state_manager.resource_available(ChannelData(chid))
 ```
+
+### Signal Coalescence Implementation
+
+When `signal-coalescence` feature is enabled, multiple resource signals are collected and processed in a single selector loop iteration.
+
+**Data Structures:**
+
+```
+#[cfg(feature = "signal-coalescence")]
+mod coalescence {
+    use std::collections::VecDeque;
+    
+    pub struct SignalBuffer {
+        pending: VecDeque<ResourceSignal>,
+        
+        #[cfg(feature = "signal-coalescence-threshold")]
+        oldest_signal_time: Option<Instant>,
+    }
+    
+    impl SignalBuffer {
+        pub fn new() -> Self {
+            SignalBuffer {
+                pending: VecDeque::new(),
+                
+                #[cfg(feature = "signal-coalescence-threshold")]
+                oldest_signal_time: None,
+            }
+        }
+        
+        pub fn add(&mut self, signal: ResourceSignal) {
+            self.pending.push_back(signal);
+            
+            #[cfg(feature = "signal-coalescence-threshold")]
+            if self.oldest_signal_time.is_none() {
+                self.oldest_signal_time = Some(Instant::now());
+            }
+        }
+        
+        pub fn should_process(&self) -> bool {
+            // Pure opportunistic: process if any signals present
+            #[cfg(not(feature = "signal-coalescence-threshold"))]
+            return !self.pending.is_empty();
+            
+            // With threshold backstop
+            #[cfg(feature = "signal-coalescence-threshold")]
+            {
+                if self.pending.is_empty() {
+                    return false;
+                }
+                // Check if oldest signal exceeded threshold
+                if let Some(time) = self.oldest_signal_time {
+                    if time.elapsed() > SIGNAL_BACKSTOP_THRESHOLD {
+                        return true;
+                    }
+                }
+                true
+            }
+        }
+        
+        pub fn drain(&mut self) -> Vec<ResourceSignal> {
+            #[cfg(feature = "signal-coalescence-threshold")]
+            { self.oldest_signal_time = None; }
+            
+            self.pending.drain(..).collect()
+        }
+    }
+}
+```
+
+**Integration with Selector Loop:**
+
+```
+SELECTOR MAIN LOOP (with signal-coalescence):
+
+#[cfg(feature = "signal-coalescence")]
+let signal_buffer = SignalBuffer::new();
+
+while running {
+    // ... core message processing ...
+    
+    // Step 2: Process resource signals
+    #[cfg(feature = "signal-coalescence")]
+    {
+        // Collect all available signals
+        while let Ok(signal) = resource_signals.try_recv() {
+            signal_buffer.add(signal);
+        }
+        
+        // Process batch if ready
+        if signal_buffer.should_process() {
+            let signals = signal_buffer.drain();
+            for signal in signals {
+                process_resource_signal(signal);
+            }
+        }
+    }
+    
+    #[cfg(not(feature = "signal-coalescence"))]
+    while let Ok(signal) = resource_signals.try_recv() {
+        process_resource_signal(signal);
+    }
+    
+    // ... rest of loop ...
+}
+```
+
+**Overhead Analysis:**
+
+```
+PER SIGNAL:
+
+Without coalescence:
+  - Selector loop entry: ~50 cycles
+  - Resource check: ~100-300 cycles
+  - Ready Pool update: ~50-100 cycles
+  - Total: ~200-450 cycles per signal
+
+With coalescence (N signals):
+  - Add to buffer: ~20-50 cycles per signal
+  - Batch process:
+    - Selector loop entry: ~50 cycles (once)
+    - Resource checks: N × ~100 cycles
+    - Ready Pool update: ~50-100 cycles (once)
+  - Total: (50 + 100N + 100) = 150 + 100N cycles
+  - Per signal: (150 + 100N) / N = 100 + 150/N cycles
+
+Comparison:
+  N=1:   ~250 vs ~250 cycles (no benefit)
+  N=5:   ~250 vs ~130 cycles (48% reduction)
+  N=10:  ~250 vs ~115 cycles (54% reduction)
+  N=20:  ~250 vs ~107 cycles (57% reduction)
+```
+
+### Signal Coalescence and Anti-Starvation Relationship
+
+Signal coalescence and anti-starvation are independent features that CAN share infrastructure when both are compiled in:
+
+```
+EXECUTION FLOW:
+
+  SIGNAL ARRIVAL
+    ↓
+  [SIGNAL COALESCENCE POINT]
+    - Multiple signals arriving together processed together
+    - signal-coalescence-threshold may trigger early processing
+    - Affects HOW FAST events enter Ready Pool
+    ↓
+  READY POOL
+    - Events waiting for dispatch
+    ↓
+  [ANTI-STARVATION CHECK POINT]
+    - Before dispatch, check Ready Pool wait times
+    - If > threshold, priority dispatch
+    ↓
+  DISPATCH
+    - Weighted entropy selection
+```
+
+**Independence:**
+- Each feature works without the other
+- Neither requires the other to be compiled in
+- Different purposes:
+  - Signal coalescence: throughput optimization
+  - Anti-starvation: fairness guarantee
+
+**Shared Infrastructure (Optional Optimization):**
+
+When both `signal-coalescence-threshold` and `anti-starvation` are compiled in, they CAN share timing infrastructure:
+
+```
+#[cfg(all(feature = "signal-coalescence-threshold", feature = "anti-starvation"))]
+mod shared_timing {
+    // Shared timing source
+    pub fn get_current_time() -> Instant { /* ... */ }
+    
+    // Shared threshold check
+    pub fn threshold_exceeded(start: Instant, threshold: Duration) -> bool {
+        get_current_time().duration_since(start) > threshold
+    }
+}
+
+// Anti-starvation uses it for Ready Pool wait time
+// Signal threshold uses it for signal buffer wait time
+// Same infrastructure, different purposes
+```
+
+**Configuration:**
+
+Both thresholds can be configured independently:
+
+```toml
+[scheduling]
+anti_starvation_threshold_ms = 100
+
+[signal-coalescence]
+backstop_threshold_ms = 5
+```
+
+The signal backstop is typically much smaller than anti-starvation threshold because signals should process quickly to unblock stalled containers.
 
 ### Layer 2: Dispatch Logic
 
@@ -1003,6 +1208,77 @@ CACHE AFFINITY (OPTIONAL OPTIMIZATION):
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Core Assignation by Class (class-core-affinity Feature)
+
+When enabled, execution contexts are partitioned by weight class:
+
+```
+CORE ASSIGNATION ARCHITECTURE:
+
+┌─────────────────────────────────────────────────────────────┐
+│                    SELECTOR                                  │
+│                                                             │
+│  Ready Pool: ALL events (single pool, single owner)         │
+│                                                             │
+│  Context pools:                                             │
+│    system_contexts: [0, 1, 2, 3]                           │
+│    user_contexts: [4, 5, 6]                                │
+│    background_contexts: [7]                                │
+│                                                             │
+│  Single selector (unchanged)                                │
+│  Single pool (unchanged)                                    │
+│  Same routing logic (unchanged)                             │
+│  Adds class as routing consideration                        │
+└─────────────────────────────────────────────────────────────┘
+
+DISPATCH WITH CLASS AFFINITY:
+
+1. event = select_from_ready_pool()  // Same selection logic
+2. class = event.container.class
+3. pool = context_pools.{class}_contexts
+4. context = select_from_pool(pool)  // Existing cache affinity logic
+5. dispatch_to(event, context)
+
+NO COMPLEXITY ADDED:
+  - No new coordination mechanisms
+  - No locks between pools
+  - Pools are static configuration, not dynamic state
+  - Same O(1) dispatch complexity
+```
+
+**Configuration Loading:**
+
+```
+#[cfg(feature = "class-core-affinity")]
+struct CoreAffinityConfig {
+    system_contexts: Vec<usize>,
+    user_contexts: Vec<usize>,
+    background_contexts: Vec<usize>,
+}
+
+#[cfg(feature = "class-core-affinity")]
+fn load_affinity_config(config: &Config, total_contexts: usize) -> CoreAffinityConfig {
+    // From config file or compute even distribution
+    let sys = config.core_affinity.system_contexts.unwrap_or(total_contexts / 2);
+    let user = config.core_affinity.user_contexts.unwrap_or(total_contexts / 3);
+    let bg = total_contexts - sys - user;
+    
+    CoreAffinityConfig {
+        system_contexts: (0..sys).collect(),
+        user_contexts: (sys..sys+user).collect(),
+        background_contexts: (sys+user..total_contexts).collect(),
+    }
+}
+```
+
+**Security Analysis:**
+
+Core assignation does NOT introduce side channels:
+- Pools are fixed at boot, not dynamic
+- No coordination between pools
+- Routing is deterministic by class (class is not secret information)
+- Timing patterns reflect class distribution, not individual containers
 
 ### Message Types
 
@@ -1450,18 +1726,24 @@ FEATURE FLAGS:
 ┌─────────────────────────────────────────────────────────────┐
 │                  FEATURE FLAGS                               │
 │                                                             │
-│  CORE (Always compiled):                                    │
+│  TIER 1: CORE ARCHITECTURAL (Always compiled):              │
 │  - weighted-entropy (architectural)                         │
 │  - catch-and-release (architectural)                        │
 │  - channels (architectural)                                 │
 │  - isolation-boundaries (architectural)                     │
 │                                                             │
-│  SCHEDULING:                                                │
+│  TIER 2: SCHEDULING:                                        │
 │  - anti-starvation                                          │
 │  - full-fairness                                            │
 │  - per-lane-weights                                         │
 │                                                             │
-│  SECURITY:                                                  │
+│  TIER 3: PERFORMANCE:                                       │
+│  - signal-coalescence                                       │
+│  - signal-coalescence-threshold                             │
+│  - class-resource-pools                                     │
+│  - class-core-affinity                                      │
+│                                                             │
+│  TIER 4: SECURITY:                                          │
 │  - rtro                                                     │
 │  - cryptographic-ipc                                        │
 │  - lightweight-handshake                                    │
@@ -1471,17 +1753,132 @@ FEATURE FLAGS:
 │  - cryptographic-entropy                                    │
 │  - hardware-rng                                             │
 │                                                             │
-│  CAPABILITIES:                                              │
+│  TIER 5: CAPABILITIES:                                      │
 │  - network-stack                                            │
 │  - usb-stack                                                │
 │  - gui-subsystem                                            │
 │  - cli-interface                                            │
 │  - audio-subsystem                                          │
 │  - dynamic-lanes                                            │
+│  - touch-subsystem                                          │
+│  - sensor-subsystem                                         │
+│  - mobile-connectivity                                      │
+│  - power-management                                         │
+│  - display-subsystem                                        │
 │                                                             │
-│  HANDOFF (Shared with CIBIOS):                              │
+│  TIER 6: HANDOFF (Shared with CIBIOS):                      │
 │  - handoff-cryptographic                                    │
 │  - handoff-lightweight                                      │
+│                                                             │
+│  TOTAL: 32 FEATURES                                         │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Feature Flag Compatibility Matrix
+
+All performance features are independent and can be combined freely.
+All capability features are independent and can be combined freely.
+
+```
+PERFORMANCE FEATURE MATRIX:
+
+                    anti    full    per-    signal  signal  class   class
+                    starv   fair    lane    coales  coales- resrc   core
+                                    wts             thres   pools   affinity
+
+anti-starvation      N/A     YES     YES     YES     YES      YES     YES
+full-fairness        YES     N/A     NO*     YES     YES      YES     YES
+per-lane-weights     YES     NO*     N/A     YES     YES      YES     YES
+signal-coalescence   YES     YES     YES     N/A     YES      YES     YES
+signal-coales-th     YES     YES     YES     YES     N/A      YES     YES
+class-resource-pools YES     YES     YES     YES     YES      N/A     YES
+class-core-affinity  YES     YES     YES     YES     YES      YES     N/A
+
+* NO: Different use cases, typically not used together
+
+CAPABILITY FEATURE MATRIX:
+
+All 11 capability features are mutually compatible.
+Any combination can be compiled together.
+```
+
+### Shared Infrastructure Opportunities
+
+```
+SHARED INFRASTRUCTURE:
+
+┌─────────────────────────────────────────────────────────────┐
+│               SHARED INFRASTRUCTURE                          │
+│                                                             │
+│  anti-starvation + signal-coalescence-threshold:            │
+│    - Share timing source                                   │
+│    - Share threshold comparison logic                       │
+│    - Single timing subsystem                               │
+│                                                             │
+│  anti-starvation + full-fairness:                          │
+│    - Share execution time tracking                         │
+│    - Unified timing for both fairness mechanisms           │
+│                                                             │
+│  all three:                                                 │
+│    - Unified timing subsystem                               │
+│    - Shared clock source                                    │
+│    - Minimal overhead for additional features               │
+│                                                             │
+│  NOTE: Sharing is optimization, not requirement.            │
+│        Each feature works independently.                    │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Handoff Mode Feature Requirements
+
+```
+HANDOFF MODE REQUIREMENTS:
+
+┌─────────────────────────────────────────────────────────────┐
+│                 HANDOFF REQUIREMENTS                         │
+│                                                             │
+│  handoff-cryptographic:                                     │
+│    REQUIRES: cryptographic-entropy                          │
+│    ENABLES: rtro, cryptographic-ipc, user-authentication,  │
+│             multi-user-isolation, audit-logging            │
+│    PROHIBITS: lightweight-handshake                        │
+│                                                             │
+│  handoff-lightweight:                                       │
+│    REQUIRES: (none)                                         │
+│    ENABLES: per-lane-weights                               │
+│    PROHIBITS: handoff-cryptographic, rtro,                 │
+│               multi-user-isolation, audit-logging          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Security Feature Dependencies
+
+```
+SECURITY FEATURE DEPENDENCIES:
+
+┌─────────────────────────────────────────────────────────────┐
+│                 SECURITY DEPENDENCIES                        │
+│                                                             │
+│  rtro:                                                      │
+│    REQUIRES: cryptographic-entropy                          │
+│    REQUIRES: handoff-cryptographic                         │
+│                                                             │
+│  cryptographic-ipc:                                         │
+│    REQUIRES: cryptographic-entropy                          │
+│    REQUIRES: handoff-cryptographic                         │
+│    ENABLES: audit-logging (optional)                       │
+│                                                             │
+│  multi-user-isolation:                                      │
+│    REQUIRES: user-authentication                            │
+│    REQUIRES: cryptographic-ipc                             │
+│    REQUIRES: handoff-cryptographic                         │
+│                                                             │
+│  audit-logging:                                            │
+│    REQUIRES: cryptographic-ipc                             │
+│    REQUIRES: handoff-cryptographic                         │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -1509,6 +1906,7 @@ PROFILE DEFINITIONS:
 │    "handoff-cryptographic",                                 │
 │  ]                                                          │
 │  smt = "disabled"                                           │
+│  optional = []                                              │
 │                                                             │
 │  BALANCED:                                                  │
 │  features = [                                               │
@@ -1521,9 +1919,15 @@ PROFILE DEFINITIONS:
 │    "gui-subsystem",                                         │
 │    "cli-interface",                                         │
 │    "handoff-cryptographic",                                 │
-│    # rtro = optional                                        │
 │  ]                                                          │
 │  smt = "disabled" (default, user may enable)                │
+│  optional = [                                               │
+│    "rtro",                                                  │
+│    "signal-coalescence",                                    │
+│    "signal-coalescence-threshold",                          │
+│    "class-resource-pools",                                  │
+│    "class-core-affinity",                                   │
+│  ]                                                          │
 │                                                             │
 │  PERFORMANCE:                                               │
 │  features = [                                               │
@@ -1534,6 +1938,12 @@ PROFILE DEFINITIONS:
 │    "handoff-cryptographic",                                 │
 │  ]                                                          │
 │  smt = "enabled"                                            │
+│  optional = [                                               │
+│    "signal-coalescence",                                    │
+│    "signal-coalescence-threshold",                          │
+│    "class-resource-pools",                                  │
+│    "class-core-affinity",                                   │
+│  ]                                                          │
 │                                                             │
 │  COMPUTE:                                                   │
 │  features = [                                               │
@@ -1542,55 +1952,146 @@ PROFILE DEFINITIONS:
 │    "cli-interface",                                         │
 │    "handoff-lightweight",                                   │
 │    "cryptographic-entropy",                                 │
-│    # anti-starvation = optional                             │
 │  ]                                                          │
 │  smt = "enabled"                                            │
+│  optional = [                                               │
+│    "anti-starvation",                                       │
+│    "signal-coalescence",                                    │
+│    "signal-coalescence-threshold",                          │
+│    "class-resource-pools",                                  │
+│    "class-core-affinity",                                   │
+│  ]                                                          │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Feature Flag Files
+### Platform Variant Definitions
 
-```toml
-# profiles/maximum-isolation.toml
-[features]
-compile_in = [
-    "rtro",
-    "cryptographic-ipc",
-    "user-authentication",
-    "multi-user-isolation",
-    "audit-logging",
-    "cryptographic-entropy",
-    "hardware-rng",
-    "network-stack",
-    "gui-subsystem",
-    "cli-interface",
-]
-handoff = "handoff-cryptographic"
-smt = "disabled"
+```
+PLATFORM VARIANTS:
 
-[defaults]
-system_weight = 1
-user_weight = 1
-background_weight = 1
+┌─────────────────────────────────────────────────────────────┐
+│                 PLATFORM VARIANTS                            │
+│                                                             │
+│  CIBOS-CLI:                                                 │
+│  required = ["cli-interface"]                               │
+│  optional = ["network-stack", "usb-stack", "audio-subsystem"]│
+│  all_profiles = true                                         │
+│                                                             │
+│  CIBOS-GUI:                                                 │
+│  required = ["gui-subsystem", "display-subsystem",          │
+│              "cli-interface"]                                │
+│  optional = ["network-stack", "usb-stack", "audio-subsystem",│
+│              "touch-subsystem"]                              │
+│  all_profiles = true                                         │
+│                                                             │
+│  CIBOS-MOBILE:                                              │
+│  required = ["touch-subsystem", "sensor-subsystem",         │
+│              "display-subsystem", "power-management",        │
+│              "cli-interface"]                                │
+│  optional = ["mobile-connectivity", "network-stack",        │
+│              "audio-subsystem", "gui-subsystem"]            │
+│  recommended_profiles = ["maximum-isolation", "balanced"]    │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-```toml
-# profiles/compute.toml
-[features]
-compile_in = [
-    "per-lane-weights",
-    "lightweight-handshake",
-    "cli-interface",
-    "cryptographic-entropy",
-]
-handoff = "handoff-lightweight"
-smt = "enabled"
+### Custom Profile Build Examples
 
-[defaults]
-system_weight = 1
-user_weight = 1
-background_weight = 1
+```
+CUSTOM BUILD EXAMPLES:
+
+┌─────────────────────────────────────────────────────────────┐
+│                    CUSTOM BUILDS                             │
+│                                                             │
+│  Maximum Throughput (Compute-like):                         │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ cargo build --no-default-features \                 │   │
+│  │   --features "signal-coalescence,\                  │   │
+│  │              signal-coalescence-threshold,\         │   │
+│  │              per-lane-weights,\                     │   │
+│  │              lightweight-handshake,\                │   │
+│  │              cli-interface,\                         │   │
+│  │              cryptographic-entropy"                  │   │
+│  │                                                      │   │
+│  │ Result: Compute-like with signal coalescence        │   │
+│  │         + threshold for backstop                     │   │
+│  │         Highest throughput configuration            │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  Mobile Device (Balanced security):                         │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ cargo build --no-default-features \                 │   │
+│  │   --features "anti-starvation,\                     │   │
+│  │              cryptographic-ipc,\                    │   │
+│  │              user-authentication,\                  │   │
+│  │              cryptographic-entropy,\                │   │
+│  │              hardware-rng,\                          │   │
+│  │              touch-subsystem,\                      │   │
+│  │              sensor-subsystem,\                     │   │
+│  │              display-subsystem,\                    │   │
+│  │              power-management,\                     │   │
+│  │              mobile-connectivity,\                  │   │
+│  │              network-stack,\                         │   │
+│  │              cli-interface,\                         │   │
+│  │              handoff-cryptographic"                  │   │
+│  │                                                      │   │
+│  │ Result: Full mobile capabilities                    │   │
+│  │         Balanced security profile                   │   │
+│  │         All sensors isolated                        │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  Fairness with Throughput:                                  │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ cargo build --no-default-features \                 │   │
+│  │   --features "anti-starvation,\                     │   │
+│  │              full-fairness,\                        │   │
+│  │              signal-coalescence,\                    │   │
+│  │              class-core-affinity,\                  │   │
+│  │              cli-interface,\                         │   │
+│  │              cryptographic-entropy,\                │   │
+│  │              handoff-cryptographic"                  │   │
+│  │                                                      │   │
+│  │ Result: Maximum fairness + throughput               │   │
+│  │         Guaranteed execution per class              │   │
+│  │         Shared timing for anti-starv + threshold    │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Feature Verification Tool
+
+```
+FEATURE VERIFICATION:
+
+┌─────────────────────────────────────────────────────────────┐
+│                 VERIFYING FEATURE FLAGS                      │
+│                                                             │
+│  Before building, verify feature combination is valid:      │
+│                                                             │
+│  cargo run --package builder -- \                           │
+│    --verify-features \                                      │
+│    --features "anti-starvation,signal-coalescence-threshold"│
+│                                                             │
+│  Output:                                                    │
+│    ✓ anti-starvation: valid                                │
+│    ✓ signal-coalescence-threshold: valid                    │
+│    ✓ Shared infrastructure available: YES                    │
+│    ✓ handoff mode: not specified, using default            │
+│    VALID: Feature combination is legal                      │
+│                                                             │
+│  Invalid combination:                                       │
+│  cargo run --package builder -- \                           │
+│    --verify-features \                                      │
+│    --features "rtro,lightweight-handshake"                  │
+│                                                             │
+│  Output:                                                    │
+│    ✓ rtro: valid                                           │
+│    ✗ lightweight-handshake: PROHIBITS rtro                  │
+│    INVALID: Feature conflict detected                       │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
