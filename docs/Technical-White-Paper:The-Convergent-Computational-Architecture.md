@@ -13,7 +13,7 @@ This document presents a comprehensive analysis of three converging technologica
 
 We establish that quantum computing faces fundamental physics constraints that render it practically incapable of threatening current cryptography. Simultaneously, CIBIOS architecture—through elimination of coordination overhead—achieves classical computational efficiency previously thought impossible, creating a new threat model for classical cryptography.
 
-This analysis introduces the concept of **CIBIOS Generations**: evolutionary stages of isolation-native computing that progressively amplify classical cryptanalytic capability. We examine the complete cryptographic landscape—including all RSA key sizes, all ECC curves, and all PQC algorithm categories—and establish a definitive security hierarchy based on mathematical complexity versus practical attack capability.
+This analysis introduces the concept of **CIBIOS Generations**: evolutionary stages of isolation-native computing that progressively amplify classical cryptanalytic capability. We examine the complete cryptographic landscape—including all RSA key sizes, all ECC curves, and all PQC algorithm categories (Lattice, Code, Hash, Isogeny, and MPC-in-the-Head)—and establish a definitive security hierarchy based on mathematical complexity versus practical attack capability.
 
 ---
 
@@ -568,11 +568,13 @@ Verification:
 
 **Status:** Maximum security. Ideal for firmware signing and root of trust. Recommended for CIBIOS boot verification.
 
-### 4.4 Category 4: Isogeny-Based Cryptography (The Warning)
+### 4.4 Category 4: Isogeny-Based Cryptography
+
+Isogeny-based cryptography relies on the difficulty of finding maps (isogenies) between elliptic curves. This category presents a unique risk profile due to recent cryptanalytic developments.
 
 #### Algorithm: SIKE (Supersingular Isogeny Key Encapsulation)
 
-**Status:** BROKEN in 2022.
+**Status:** **BROKEN in 2022.**
 
 **What Happened:**
 - SIKE was a Round 4 NIST candidate
@@ -582,6 +584,52 @@ Verification:
 
 **The Lesson:**
 New mathematical constructions can collapse instantly. "Elegant" does not mean "secure." This validates concerns about PQC implementation maturity.
+
+#### Algorithm: SQISign (The "Light on Wire" Candidate)
+
+**Status:** Active research candidate for future standardization (NIST "on-ramp").
+
+**Mechanism:**
+SQISign uses isogenies (maps between elliptic curves) but employs a different mathematical structure (Quaternion Algebras) than the broken SIKE.
+
+```
+SQISIGN MECHANISM:
+
+Public Key: A destination curve E_A
+Signature: A path (isogeny) σ from a starting curve E_0 to E_A
+
+Security Basis:
+  Finding an isogeny path between two random supersingular curves
+```
+
+**Size Profile (NIST Level I):**
+
+| Metric | SQISign | Dilithium2 | SPHINCS+-128f | ECC P-256 |
+|---|---|---|---|---|
+| **Public Key** | **64 bytes** | 1,312 bytes | 32 bytes | 32 bytes |
+| **Signature** | **177 bytes** | 2,420 bytes | 7,856 bytes | 64 bytes |
+| **Total** | **241 bytes** | 3,732 bytes | 7,888 bytes | 96 bytes |
+
+**Threat Analysis:**
+
+**Threat 1: CIBIOS Gen 3 (Classical)**
+- **Attack:** Claw-in-the-Graph search / Meet-in-the-Middle
+- **Complexity:** ~2^128 operations
+- **Time:** ~10^13 years
+- **Verdict:** **SAFE.** The graph search space is too large for classical parallelism.
+
+**Threat 2: Hybrid (CIBIOS + Quantum)**
+- **Attack:** Kuperberg's Algorithm / Quantum Claw Finding
+- **Critical Distinction:** Unlike Shor's algorithm (Polynomial time for RSA/ECC), Isogeny attacks are **Sub-Exponential**.
+- **Complexity:** Reduces from 2^128 to roughly 2^60 - 2^80 logical quantum gates.
+- **Analysis:** If a Hybrid system achieves thousands of logical qubits (enabled by CIBIOS error correction), SQISign security degrades from "10^13 years" to potentially "months."
+- **Verdict:** **MARGINAL.** It degrades under quantum pressure, unlike Lattices.
+
+**The "SIKE" Risk Factor:**
+The probability of a new mathematical shortcut (similar to the SIKE break) is **Non-Zero**. The mathematical foundation of isogenies is young (15-20 years) compared to hash functions (30+ years) or lattices (25+ years).
+
+**SQISign Recommendation:**
+**HIGH RISK / HIGH REWARD.** Use only if "Tiny Size" (241 bytes total) is an absolute physical constraint where transmitting even 5KB is impossible. It is not "Safe" in the maximum sense defined for critical infrastructure.
 
 ### 4.5 Category 5: Multivariate Cryptography
 
@@ -594,22 +642,84 @@ New mathematical constructions can collapse instantly. "Elegant" does not mean "
 - Broken by classical cryptanalysis before standardization
 - Demonstrates that PQC is not automatically secure
 
-### 4.6 Complete PQC Security Summary
+### 4.6 Category 6: MPC-in-the-Head (MPCitH) Signatures
 
-| Algorithm | Type | Classical Security | CIBIOS Gen 3 Impact | Recommendation |
+This category represents a paradigm shift: instead of number-theoretic problems (Lattices, Isogenies), security is derived from symmetric primitives (AES, Hashes) combined with Zero-Knowledge Proofs.
+
+**Leading Candidates:** AIM (Algebraic Intensive Minimizing), Mirith.
+
+**Mechanism:**
+```
+MPCitH SIGNING MECHANISM:
+
+Concept:
+  The signer "simulates" a Multi-Party Computation (MPC) protocol
+  inside their own computer.
+
+Process:
+  1. Secret key is split into N virtual "shares"
+  2. Prover simulates all N parties communicating
+  3. Generates a Zero-Knowledge Proof that the "parties" know the secret
+  4. Publishes the "transcript" of this simulation as the signature
+
+Security Basis:
+  Breaking the signature requires breaking the underlying
+  symmetric primitive (AES-256, SHA-256) or finding a flaw
+  in the Zero-Knowledge proof system.
+```
+
+**Size Profile (AIM/Mirith NIST Level I):**
+
+| Metric | MPCitH (AIM) | SQISign | Dilithium2 | SPHINCS+-128f |
 |---|---|---|---|---|
-| **Kyber-512** | Lattice | 128-bit | Safe (10^12 years) | Acceptable for low-security |
-| **Kyber-768** | Lattice | 192-bit | Safe (10^20 years) | **Recommended standard** |
-| **Kyber-1024** | Lattice | 256-bit | Safe (10^32 years) | High-security applications |
-| **Dilithium2** | Lattice | 128-bit | Safe | Acceptable |
-| **Dilithium3** | Lattice | 192-bit | Safe | **Recommended standard** |
-| **Dilithium5** | Lattice | 256-bit | Safe | High-security |
-| **FALCON-512** | Lattice | 128-bit | Safe (implementation risk) | Use with caution |
-| **FALCON-1024** | Lattice | 256-bit | Safe (implementation risk) | Use with caution |
-| **Classic McEliece** | Code | 256-bit+ | Safe (studied since 1978) | **Maximum security** |
-| **SPHINCS+** | Hash | 256-bit | Safe (hash-based) | **Boot/firmware** |
-| **SIKE** | Isogeny | BROKEN | N/A | Do not use |
-| **Rainbow** | Multivariate | BROKEN | N/A | Do not use |
+| **Public Key** | **64 bytes** | **64 bytes** | 1,312 bytes | 32 bytes |
+| **Signature** | ~4,500 bytes | **177 bytes** | 2,420 bytes | 7,856 bytes |
+| **Total** | ~4.6 KB | **0.24 KB** | 3.7 KB | 7.9 KB |
+
+**Threat Analysis:**
+
+**Threat 1: CIBIOS Gen 3 (Classical)**
+- **Attack:** Brute-forcing AES-256 or SHA-256.
+- **Complexity:** 2^256.
+- **Time:** 10^55 years.
+- **Verdict:** **IMPENETRABLE.**
+
+**Threat 2: Hybrid (CIBIOS + Quantum)**
+- **Attack:** Grover's Algorithm on AES-256.
+- **Complexity:** √(2^256) = 2^128 sequential oracle queries.
+- **Analysis:** Grover's algorithm cannot be easily parallelized; depth is the constraint.
+- **Time:** ~10^21 years (sequential execution constraint).
+- **Verdict:** **IMPENETRABLE.**
+
+**The "New Math" Risk:**
+- MPCitH security rests on AES/Hash primitives (studied since 1990s).
+- Zero-Knowledge Proof systems are well-understood (studied since 1980s).
+- **Verdict:** **ZERO RISK.** This is "Old Math" protection.
+
+**CIBIOS Synergy:**
+MPCitH signing is computationally heavy (simulating many parties). On a traditional OS, this is slow. On CIBIOS, the N virtual parties of the MPC can be simulated in parallel across thousands of lanes instantly.
+- **Result:** CIBIOS makes MPCitH signing/verification effectively "free" (near-zero time), turning the "heavy compute" penalty into a non-issue.
+
+**MPCitH Recommendation:**
+**THE WINNER for Lightweight + Safe.** It offers:
+1. Light Keys (64 bytes - same as SQISign)
+2. Safe Math (AES/Hash - same as SPHINCS+)
+3. Hybrid-Proof security
+4. Perfect synergy with CIBIOS architecture
+
+### 4.7 Complete PQC Security Summary
+
+| Algorithm | Type | Classical Security | Hybrid Security | "New Math" Risk | Recommendation |
+|---|---|---|---|---|---|
+| **Kyber-768** | Lattice | Safe (10^20 years) | Safe (10^15 years) | Moderate | **Standard** |
+| **Dilithium3** | Lattice | Safe (10^20 years) | Safe (10^15 years) | Moderate | **Standard** |
+| **FALCON** | Lattice | Safe | Safe | Moderate | Use with caution |
+| **Classic McEliece** | Code | Safe | Safe | Low | **Maximum Security** |
+| **SPHINCS+** | Hash | Safe | Safe | **None** | **Boot/Firmware** |
+| **SQISign** | Isogeny | Safe (10^13 years) | **Marginal** (Degrades) | **HIGH** (SIKE Lesson) | **Last Resort** |
+| **MPCitH (AIM)** | Symmetric | **Impenetrable** | **Impenetrable** | **None** | **Lightweight Winner** |
+| **SIKE** | Isogeny | BROKEN | N/A | Failed | Do not use |
+| **Rainbow** | Multivariate | BROKEN | N/A | Failed | Do not use |
 
 ---
 
@@ -667,43 +777,49 @@ IMPLICATION:
 | Phase 2 | 5 - 15 years | 50,000 - 400,000 | RSA-2048/ECC-256 vulnerable |
 | Phase 3 | 15+ years | 400,000+ | All RSA/ECC obsolete |
 
-### 5.3 Hybrid Attack on PQC: Quantum Sieving
+### 5.3 Hybrid Attack on PQC: Algorithmic Distinctions
 
-The question arises: Can the hybrid system accelerate PQC attacks?
+The hybrid system affects PQC categories differently based on the quantum speedup available.
 
-**The Mechanism:**
-1. CIBIOS manages the lattice vector database
-2. Quantum processor uses amplitude amplification to find "reducing pairs"
-3. CIBIOS performs the algebraic reduction
+**Attack Analysis by Category:**
 
-**The Analysis:**
-
-For Kyber-768:
+**Lattice-Based (Kyber, Dilithium):**
 - Classical BKZ complexity: ~2^150
-- Quantum-assisted sieving: Theoretical ~2^130 (best estimates)
-- Time with Gen 3 CIBIOS: Still 10^15+ years
+- Quantum-assisted sieving: ~2^130 (theoretical best)
+- Time with Hybrid: 10^15+ years
+- **Result:** Exponential wall absorbs attack.
 
-**Result:** The exponential wall of lattice geometry absorbs even quantum assistance. The dimension is simply too high.
+**Isogeny-Based (SQISign):**
+- Classical complexity: ~2^128
+- Quantum attack (Kuperberg): Sub-exponential ~2^60-2^80
+- Time with Hybrid: Potentially months (if qubit count sufficient)
+- **Result:** Security degrades significantly. **VULNERABLE.**
+
+**Hash/Symmetric-Based (SPHINCS+, MPCitH):**
+- Classical complexity: 2^256
+- Quantum attack (Grover): 2^128 sequential operations
+- Time with Hybrid: 10^21 years
+- **Result:** Impenetrable due to sequential depth requirement.
 
 ### 5.4 The Hybrid Security Matrix
 
 | Cryptography | Classical Only | Hybrid (CIBIOS + Quantum) | Status |
 |---|---|---|---|
 | RSA-1024 | ~48 days (Gen 3) | Hours | **BROKEN** |
-| RSA-2048 | 550,000 years (Gen 3) | Hours-Days (if 400k qubits) | **VULNERABLE** (future) |
-| RSA-4096 | 10^16 years (Gen 3) | Days-Weeks (if 800k qubits) | **VULNERABLE** (future) |
-| ECC P-256 | 10^16 years (Gen 3) | Hours (if 250k qubits) | **VULNERABLE** (future) |
-| ECC P-384 | 10^35 years (Gen 3) | Hours (if 350k qubits) | **VULNERABLE** (future) |
-| ECC P-521 | 10^55 years (Gen 3) | Hours (if 500k qubits) | **VULNERABLE** (future) |
-| Kyber-768 | 10^20 years (Gen 3) | 10^15 years (hybrid) | **SAFE** |
-| Kyber-1024 | 10^32 years (Gen 3) | 10^25 years (hybrid) | **SAFE** |
+| RSA-2048 | 550,000 years (Gen 3) | Hours-Days | **VULNERABLE** |
+| ECC P-256 | 10^16 years (Gen 3) | Hours | **VULNERABLE** |
+| Kyber-768 | 10^20 years (Gen 3) | 10^15 years | **SAFE** |
+| SQISign | 10^13 years (Gen 3) | Months-Years | **MARGINAL** |
 | Classic McEliece | 10^20+ years | 10^15+ years | **SAFE** |
-| SPHINCS+ | 10^55 years (hash) | 10^16 years (Grover) | **SAFE** |
+| SPHINCS+ | 10^55 years | 10^16 years | **SAFE** |
+| MPCitH (AIM) | 10^55 years | 10^21 years | **SAFE** |
 
 **The Critical Distinction:**
 
-- **RSA/ECC:** Polynomial-time quantum algorithms exist (Shor's). Once qubit count is sufficient, security collapses entirely.
-- **PQC (Lattice):** Only exponential-time algorithms exist. Even quantum computers provide marginal speedup. Security degrades but does not collapse.
+- **RSA/ECC:** Polynomial-time quantum algorithms exist (Shor's). Security collapses entirely.
+- **SQISign:** Sub-exponential quantum algorithms exist. Security degrades significantly.
+- **Lattice:** Only exponential-time algorithms exist. Security holds.
+- **Hash/Symmetric:** Sequential depth prevents quantum speedup. Security absolute.
 
 ---
 
@@ -724,15 +840,18 @@ The NIST Post-Quantum Cryptography standardization process finalized selections 
 | Kyber-768 | 1,184 bytes | 1,088 bytes | 37x vs X25519 |
 | Dilithium3 | 1,952 bytes | 3,293 bytes | 51x vs Ed25519 |
 | SPHINCS+-192f | 48 bytes | 16,216 bytes | 253x vs Ed25519 |
+| SQISign (L1) | 64 bytes | 177 bytes | **3x vs Ed25519** |
+| MPCitH (AIM) | 64 bytes | 4,500 bytes | 70x vs Ed25519 |
 | Classic McEliece | 1,044,992 bytes | 156 bytes | 32,000x public key |
 
 (c) **Performance Impact:**
 
-| Operation | Classical (Ed25519) | PQC (Dilithium3) | Overhead |
+| Operation | Classical (Ed25519) | PQC (Dilithium3) | MPCitH (Heavy) |
 |---|---|---|---|
-| Key Generation | ~50,000 cycles | ~500,000 cycles | 10x |
-| Sign | ~50,000 cycles | ~1,000,000 cycles | 20x |
-| Verify | ~100,000 cycles | ~400,000 cycles | 4x |
+| Sign | ~50,000 cycles | ~1,000,000 cycles | ~10,000,000 cycles* |
+| Verify | ~100,000 cycles | ~400,000 cycles | ~5,000,000 cycles* |
+
+*MPCitH is computationally heavy on traditional systems; CIBIOS parallelism eliminates this penalty.
 
 (d) **Implementation Maturity:** Less audited code, more potential vulnerabilities.
 
@@ -775,11 +894,8 @@ If quantum computing fails (decoherence wall), PQC protects against a phantom th
 |---|---|---|---|---|
 | RSA-2048 | Hybrid | Hours-Days | 10-15 years | Plan transition |
 | RSA-3072 | Hybrid | Days | 15-20 years | Plan transition |
-| RSA-4096 | Hybrid | Weeks | 20+ years | Plan transition |
 | ECC P-256 | Hybrid | Hours | 10-15 years | Plan transition |
-| ECC P-384 | Hybrid | Hours | 15-20 years | Plan transition |
-| ECC P-521 | Hybrid | Hours | 20+ years | Plan transition |
-| Curve25519 | Hybrid | Hours | 10-15 years | Plan transition |
+| **SQISign** | Hybrid | Months-Years | Unknown | **Caution** |
 
 ### Tier 3: Theoretical Risk (Marginal)
 
@@ -798,15 +914,16 @@ If quantum computing fails (decoherence wall), PQC protects against a phantom th
 | **Dilithium5** | 256-bit | High-security signatures |
 | **Classic McEliece** | 256-bit+ | Long-term data archival |
 | **SPHINCS+** | 256-bit | Firmware/boot verification |
+| **MPCitH (AIM)** | 256-bit | Lightweight + Safe signatures |
 | **AES-256** | 256-bit | Symmetric encryption |
-| **SHA-512/SHA3-512** | 512-bit | Hashing |
 
 ### Tier 5: Maximum Security (Ultra-Conservative)
 
 | Algorithm | Security Basis | Use Case |
 |---|---|---|
-| Classic McEliece-8192128 | 45+ years of analysis, no quantum speedup | Critical infrastructure, state secrets |
-| SPHINCS+-256s | Hash-based, minimal assumptions | Root of trust, firmware |
+| Classic McEliece-8192128 | 45+ years of analysis | Critical infrastructure |
+| SPHINCS+-256s | Hash-based, minimal assumptions | Root of trust |
+| MPCitH (AIM/Mirith) | Symmetric-based, CIBIOS-native | Constrained environments |
 
 ---
 
@@ -816,8 +933,8 @@ If quantum computing fails (decoherence wall), PQC protects against a phantom th
 
 **Boot Verification (CIBIOS Standard Profile):**
 - **Recommended:** SPHINCS+ (hash-based, minimal trust surface)
-- **Alternative:** Classic McEliece (maximum security, larger keys)
-- **Rationale:** Hash-based security provides strongest guarantees for firmware integrity
+- **Alternative:** MPCitH (if signature size <5KB is required)
+- **Rationale:** Hash-based/symmetric security provides strongest guarantees for firmware integrity
 
 **Inter-Process Communication (CIBOS):**
 - **Compute Profile (Air-Gapped):** Classical only (X25519) or symmetric (AES-256-GCM)
@@ -853,9 +970,24 @@ If quantum computing fails (decoherence wall), PQC protects against a phantom th
 - **Key Exchange:** Classic McEliece + Kyber-1024 (dual)
 - **Encryption:** AES-256-GCM or ChaCha20-Poly1305
 - **Signatures:** SPHINCS+ or Dilithium5
+- **Lightweight Signatures:** MPCitH (AIM/Mirith)
 - **Hashing:** SHA3-512 or SHA-512
 
 **Rationale:** Layered defense using most conservative algorithms.
+
+### 8.4 For "Light on Wire" Scenarios
+
+When transmission bandwidth is severely constrained (satellite, IoT, blockchain):
+
+| Scenario | Recommended Algorithm | Total Size | Security |
+|---|---|---|---|
+| **Maximum Constraint** (Bytes critical) | SQISign | 241 bytes | Marginal (Hybrid risk) |
+| **Safe + Light** | MPCitH (AIM) | ~4.6 KB | Maximum |
+| **Standard Safe** | Dilithium2 | 3.7 KB | High |
+| **Conservative** | FALCON-512 | ~1.6 KB | High |
+
+**Strategic Guidance:**
+If 4KB transmission is impossible, use SQISign with the understanding that a hybrid quantum breakthrough could compromise it. Otherwise, MPCitH provides the optimal balance of size (64-byte keys) and absolute security (symmetric-based).
 
 ---
 
@@ -883,7 +1015,7 @@ If quantum computing fails (decoherence wall), PQC protects against a phantom th
 │  LAYER 3: HYBRID ARCHITECTURE (CIBIOS + QUANTUM)                           │
 │  Status: Theoretical maximum computational capability                      │
 │  Capability: CIBIOS enables quantum error correction at scale              │
-│  Threat: Renders all RSA/ECC obsolete once qubit counts reach 250k-400k   │
+│  Threat: Renders all RSA/ECC/SQISign obsolete once qubits reach 250k-400k │
 │  Timeline: 10-15 years to practical realization                            │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -894,14 +1026,21 @@ If quantum computing fails (decoherence wall), PQC protects against a phantom th
 **On RSA/ECC:**
 All RSA and ECC cryptography is on a trajectory to obsolescence. The combination of CIBIOS classical optimization and potential hybrid quantum systems renders the mathematical foundations of RSA/ECC permanently compromised. Organizations must plan transitions to PQC.
 
-**On PQC:**
-PQC (specifically Kyber-768+, Dilithium3+, Classic McEliece, SPHINCS+) remains secure against all known attack vectors including CIBIOS Gen 3 and hybrid quantum-classical systems. The exponential complexity of lattice problems provides adequate security margin.
+**On SQISign:**
+SQISign offers ECC-like size but carries Isogeny-like risk. It is the only PQC signature algorithm that degrades significantly under hybrid attack (sub-exponential vs. exponential). Use only when size is the absolute constraint and security requirements are moderate.
+
+**On MPCitH:**
+MPC-in-the-Head schemes (AIM, Mirith) represent the optimal solution for "Light on Wire" scenarios that require maximum security. They combine:
+- 64-byte keys (same as SQISign)
+- 4-5KB signatures (smaller than SPHINCS+)
+- AES/Hash-based security (impervious to hybrid attacks)
+- Perfect synergy with CIBIOS parallelism
+
+**On Lattice-Based PQC:**
+Kyber and Dilithium remain secure against all known attack vectors including CIBIOS Gen 3 and hybrid quantum-classical systems. The exponential complexity of lattice problems provides adequate security margin. Recommended as general-purpose standards.
 
 **On Implementation Risk:**
 PQC's primary vulnerability is not mathematical but implementational. New code has undiscovered side-channels. CIBIOS amplifies exploitation of these vulnerabilities. Maturity and auditing are critical.
-
-**On the Quantum Threat:**
-Pure quantum computing faces fundamental scaling barriers. However, CIBIOS-enabled quantum error correction could make quantum cryptanalysis practical within 10-15 years. The threat is real but deferred.
 
 **The Strategic Imperative:**
 Deploy PQC not because quantum computers work today, but because:
@@ -955,8 +1094,20 @@ Deploy PQC not because quantum computers work today, but because:
 | McEliece-6688128 | Code | 256-bit | 10^32 Years | 10^32 Years | Safe |
 | SPHINCS+-128f | Hash | 128-bit | 10^16 Years | 10^8 Years | Safe |
 | SPHINCS+-256f | Hash | 256-bit | 10^55 Years | 10^16 Years | Safe |
+| **SQISign (L1)** | Isogeny | 128-bit | 10^13 Years | **Months-Years** | **Marginal** |
+| **MPCitH (AIM)** | Symmetric | 256-bit | 10^55 Years | 10^21 Years | **Maximum** |
 
 *Implementation risk due to floating-point operations
+
+### PQC Size Comparison Table
+
+| Algorithm | Public Key | Signature | Total | Security |
+|---|---|---|---|---|
+| **SQISign (L1)** | 64 B | 177 B | **241 B** | Marginal |
+| **MPCitH (AIM)** | 64 B | 4,500 B | ~4.6 KB | Maximum |
+| FALCON-512 | 897 B | 690 B | ~1.6 KB | High |
+| Dilithium2 | 1,312 B | 2,420 B | ~3.7 KB | High |
+| SPHINCS+-128f | 32 B | 7,856 B | ~7.9 KB | Maximum |
 
 ---
 
